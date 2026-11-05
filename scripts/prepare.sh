@@ -54,7 +54,7 @@ PY
 fix=""
 while read -r r to via dev; do
   [ -n "$r" ] || continue
-  got=$(on $r "ip -o route get $to" 2>/dev/null || true)
+  got=$(on $r "ip -o route get $to" < /dev/null 2>/dev/null || true)   # < /dev/null: ssh would read the loop's input
   case "$got" in *"via $via dev $dev"*) ;; *)
     if [ "${APPLY_ROUTES:-0}" = 1 ]; then
       on $r "sudo -n ip route replace $to/32 via $via dev $dev" || die "rank $r: could not add the route (sudo)"
@@ -117,6 +117,7 @@ for r in 0 1 2; do
   [ -z "$nf" ] || die "rank $r: missing libraries: $nf (CUDA_LIB=$CUDA_LIB)"
 done
 note "same binaries and NCCL on all three ($want); every library resolves"
+bash "$ROOT/scripts/ablit.sh"
 
 step "3/8 Kit and RoPE tables (pool $POOL: $ROPE_ROWS rows)"
 REF=$DATA_DIR/rope-ref

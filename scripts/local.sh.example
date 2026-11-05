@@ -17,3 +17,11 @@ WORKER2=user@192.0.2.3         # ssh target of rank 2
 # PARALLEL=12
 # REASONING=max                # default: the server's own
 # SERVED_NAME=deepseek-v4.1-flash
+
+# Stock and abliterated on one server (README). Accept the terms of drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated
+# on the Hub with the account of your HF token first.
+# ABLIT=1                      # serve both: SERVED_NAME-ablit and SERVED_NAME-stock choose per request
+# ABLIT_DEFAULT=1              # what the plain SERVED_NAME gives: 1 abliterated, 0 stock
+# ABLIT_LAYERS=18-25           # layers the edit applies to (10-35 possible)
+# ABLIT_LAMBDA=3.5             # edit strength
+# RANK_ENV="NCCL_DEBUG=INFO"   # more environment for every rank

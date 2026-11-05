@@ -36,6 +36,11 @@ if any_running; then
   [ $RESTART = 1 ] || die "a rank is running: ./start.sh restart, or ./stop.sh"
   note "stopping the running ranks (requests in flight are cut off)"; stop_all
 fi
+bash "$ROOT/scripts/ablit.sh"
+for r in 0 1 2; do   # the loader reads the rank cache with buffered reads: 128 KB readahead caps them at ~1 GB/s
+  ra=$(on $r "d=\$(lsblk -no PKNAME \$(findmnt -no SOURCE --target ${RT[$r]}) 2>/dev/null | head -1); cat /sys/block/\${d:-nvme0n1}/queue/read_ahead_kb 2>/dev/null" || true)
+  [ -z "$ra" ] || [ "$ra" -ge 1024 ] || note "rank $r: read_ahead_kb $ra; 4096 loads ~2x faster (README, Requirements)"
+done
 ss -ltn | grep -qE ":($PORT|$MASTER_PORT|$((MASTER_PORT + 1))) " && die "port $PORT, $MASTER_PORT or $((MASTER_PORT + 1)) is in use here"
 [ "$HOST" = 127.0.0.1 ] || [ -n "$API_KEY_FILE" ] || note "warning: serving on $HOST with no API key (API_KEY_FILE): anyone who can reach port $PORT can use it"
 write_launch_config
@@ -78,6 +83,12 @@ reply=$(api /v1/chat/completions -H 'Content-Type: application/json' -d "{\"mode
 echo "$reply" | python3 -c "import json,sys; m=json.load(sys.stdin)['choices'][0]['message']; print('   reply:', (m.get('content') or '').strip()[:200])" \
   || die "the smoke test failed: $reply"
 echo "$reply" | grep -q '51' || note "warning: the reply does not contain 51"
+if [ "$ABLIT" = 1 ]; then
+  n=$(awk '/ start rank 0$/{n=0} /^ablit: layer/{n++} END{print n+0}' "${RT[0]}/logs/rank0.log")  # this run's lines
+  api /v1/models | grep -q "$SERVED_NAME-stock" && [ "$n" -gt 0 ] \
+    && note "abliteration: per request on $n layers; $SERVED_NAME = $([ "$ABLIT_DEFAULT" = 1 ] && echo abliterated || echo stock); $SERVED_NAME-ablit and $SERVED_NAME-stock choose" \
+    || note "warning: ABLIT=1 but the server has no -stock id or rank 0 loaded no direction (scripts/ablit.sh)"
+fi
 
 h=$HOST; [ "$h" = 0.0.0.0 ] && h=$(hostname -I | awk '{print $1}')
 step "$SERVED_NAME is live on http://$h:$PORT/v1"

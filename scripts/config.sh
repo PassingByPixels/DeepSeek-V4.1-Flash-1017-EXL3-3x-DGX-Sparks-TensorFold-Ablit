@@ -41,6 +41,22 @@ CHAT_TEMPLATE_SHA256=7d1356675e429ec4a55cbcc1a6fbeb40615dbeb257aca25b8c3705a4208
 PLAN_SHA256=${PLAN_SHA256-926e10858b41a0d11c94c4a408cafa3e5fdb44dc212c9a8756054a3713919261}
 RANK_SHA256=${RANK_SHA256-11264938fbfe2daa3c316cb6c3ec2695b829fca7d79f7ccd5ff7646059ffe917 7e4b1c4f2452728026cbec03f3777c288d51a150d89c5efbdcc8584615460d73 af38459f37b3cb7c7adf229dff00c19839e23372a2f3c3e6a90706826a4ad811}   # the three rank caches
 
+# Per-request abliteration (README, "Stock and abliterated on one server"). ABLIT=1 serves both on one server:
+# the -ablit and -stock model ids choose per request, ABLIT_DEFAULT what the plain SERVED_NAME gives. The edit is
+# drowzeys' Keys direction on attn.wo_b, applied at run time; the overlay repository is gated (accept its terms).
+ABLIT=${ABLIT:-0}
+ABLIT_DEFAULT=${ABLIT_DEFAULT:-1}     # 1: SERVED_NAME is abliterated; 0: SERVED_NAME is stock
+ABLIT_LAYERS=${ABLIT_LAYERS:-18-25}   # layers the edit applies to (the overlay covers 10-35; 18-25 measured best)
+ABLIT_LAMBDA=${ABLIT_LAMBDA:-3.5}     # edit strength (the overlay's)
+ABLIT_REPO=drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated
+ABLIT_REV=de412d2249632903dace23399526e00a145aada5
+ABLIT_SIDECAR=wo_b_l10_35_1017.safetensors
+
+# NCCL on a switchless triangle: the switchless build's ring mode (README, Requirements). RANK_ENV: anything else to
+# export to every rank (e.g. NCCL_DEBUG=INFO).
+NCCL_ENV=${NCCL_ENV-NCCL_SWITCHLESS_RING_ONLY=1 NCCL_ALGO=Ring}
+RANK_ENV=${RANK_ENV:-}
+
 # Where everything lives on each Spark. Head: ~700 GB at the peak of the setup (checkpoint ~253, Engram source ~203,
 # three rank caches ~86 each before ranks 1 and 2 move to their Sparks, Engram cut ~68); ~400 GB after. Others ~160 GB.
 DATA_DIR=${DATA_DIR:-$HOME/.cache/dsv41-1017-tp3}

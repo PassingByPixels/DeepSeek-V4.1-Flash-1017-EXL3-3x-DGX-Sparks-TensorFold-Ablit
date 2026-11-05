@@ -95,11 +95,16 @@ for i in range(3):
         via = next(str(r["iface"].ip) for r in ranks[j]["rails"] if r["iface"].network == net)
         routes.append({"rank": i, "to": a, "dev": ranks[i]["rails"][k]["netdev"], "via": via})
 
+# NCCL's HCAs: one rail per peer, the first each cable gives. The switchless NCCL build takes at most two listener
+# GIDs; with all four rails NCCL init fails ("more than two eligible listener GIDs"). The runtime keeps all four.
+def nccl_hcas(i):
+    return [ranks[i]["rails"][k]["dev"] for k in sorted(shared(i, j)[0] for j in range(3) if j != i)]
+
 topo = {"schema": "ds41f.tensorfold-topology.v1", "master_address": master, "nccl_interface": ranks[0]["rails"][r01]["netdev"],
-        "nccl_hcas": [r["dev"] for r in ranks[0]["rails"]], "nccl_address_range": str(rng),
+        "nccl_hcas": nccl_hcas(0), "nccl_address_range": str(rng),
         "ranks": [{"rank": i, "host": ranks[i]["host"], "rdma_devices": [r["dev"] for r in ranks[i]["rails"]],
                    "gid_index": gids[i].pop(), "peer_masks": masks[i], "nccl_interface": ranks[i]["rails"][sock[i]]["netdev"],
-                   "nccl_hcas": [r["dev"] for r in ranks[i]["rails"]],
+                   "nccl_hcas": nccl_hcas(i),
                    "addresses": [str(r["iface"]) for r in ranks[i]["rails"]]} for i in range(3)]}
 out.mkdir(parents=True, exist_ok=True)
 (out / "topology.json").write_text(json.dumps(topo, indent=2) + "\n")

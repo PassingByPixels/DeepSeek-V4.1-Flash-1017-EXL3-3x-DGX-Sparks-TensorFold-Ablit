@@ -1,0 +1,396 @@
+ablit-runtime.patch: run-time abliteration for LakyFx TensorFold TP3 (runtime snapshot 61357deb, extracted by its
+extract.py into $DATA_DIR/build/source). Apache-2.0, like the TensorFold sources it changes. Changes, in short:
+  - zig/src/families/dsv41/abl.zig (new): TF_ABLIT loads a rank-1 direction per layer; after attn.wo_b each rank
+    applies y -= lambda * mask[row] * (r . y) r to its fp32 partial (linear, so the all-gathered sum gets the same edit).
+  - cublas.zig: Sdgmm and a k=1 Sgemm. model.zig / prompt.zig / round.zig: the edit and the per-row mask.
+  - lanes.zig: each slot carries its stream steer (one byte in the fill_begin frame to the followers).
+  - core lanes/engine_api/lane_host, server chat/openai/serve: steer from the model id (-ablit / -stock) or a boolean
+    "ablit" field; TF_ABLIT_DEFAULT for the plain id; an edited request gets its own prompt-cache namespace.
+git apply skips these lines.
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 6901d9f..67f7ab7 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -51,6 +51,8 @@ pub const Request = struct {
+     prompt: []const u32,
+     /// Prefix-cache namespace only; no effect on model tokens or sampling.
+     cache_namespace: ?[32]u8 = null,
++    /// The dsv41 run-time edit (abl.zig): 1 edited, 0 stock.
++    steer: u8 = 0,
+     /// The prompt's images in order, each span inside the prompt (its positions hold the image token).
+     images: []const Image = &.{},
+     max_tokens: u32,
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index b65b456..d42082b 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -391,6 +391,7 @@ pub const LaneHost = struct {
+             .reuse = reuse,
+             .prefill_progress = .{ .ptr = job, .at = Job.progress },
+             .images = r.images,
++            .steer = r.steer,
+         }) catch {
+             job.proposer.deinit();
+             return h.drop(job, "out of memory");
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index 00caa29..4cecc06 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -137,6 +137,7 @@ pub const Spec = struct {
+     reuse: Reuse = .{},
+     prefill_progress: ?MarkHook = null, // confirmed GPU chunk boundary, observational only
+     images: []const Image = &.{}, // in prompt order; the caller's until the stream is released
++    steer: u8 = 0, // the dsv41 run-time edit (abl.zig): 1 edited, 0 stock
+ };
+ 
+ pub const Stream = struct {
+@@ -159,6 +160,7 @@ pub const Stream = struct {
+     reuse: Reuse = .{},
+     prefill_progress: ?MarkHook = null,
+     images: []const Image = &.{},
++    steer: u8 = 0,
+     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
+     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
+     context: std.ArrayList(u32) = .empty,
+@@ -213,6 +215,7 @@ pub const Stream = struct {
+             .reuse = spec.reuse,
+             .prefill_progress = spec.prefill_progress,
+             .images = spec.images,
++            .steer = spec.steer,
+         };
+         try s.context.appendSlice(gpa, spec.prompt);
+         return s;
+diff --git a/zig/src/families/dsv41/abl.zig b/zig/src/families/dsv41/abl.zig
+new file mode 100644
+index 0000000..e0ac8c9
+--- /dev/null
++++ b/zig/src/families/dsv41/abl.zig
+@@ -0,0 +1,82 @@
++//! Run-time abliteration (a local patch, not upstream TensorFold): a rank-1 edit of attn.wo_b's output on chosen
++//! layers, y <- y - lam * mask[row] * (r . y) * r, applied to each rank's fp32 partial before the gather. The edit is
++//! linear, so the sum of the ranks' partials gets the same edit. mask[row] is 1 on an edited row and 0 on a stock row.
++//! TF_ABLIT=<file>: "ABL1", u32 hidden, u32 count, then count records { u32 layer, f32 lam, f32[hidden] r (unit) }.
++const std = @import("std");
++const cuda = @import("cuda");
++const prompt = @import("prompt.zig");
++
++pub const max_layers = 64;
++pub const max_rows = 2048; // model.chunk_rows: a prompt chunk's rows at most (a round's are fewer)
++
++pub const Abl = struct {
++    buf: cuda.DeviceBuffer,
++    dirs: [max_layers]u64 = @splat(0),
++    lam: [max_layers]f32 = @splat(0),
++    t: u64 = 0, // f32 [max_rows]: r . y of each row
++    ts: u64 = 0, // f32 [max_rows]: t times the row's mask
++    mask: u64 = 0, // f32 [max_rows]
++    host: [max_rows]f32 = @splat(1), // the mask's rows on the device (the last upload)
++    want: [max_rows]f32 = @splat(1),
++
++    /// mask[0..n] from `want` (the caller's), uploaded when it differs from the device's.
++    fn push(x: *Abl, e: *const prompt.Engine, n: usize) !void {
++        if (n > max_rows) return error.AblitRows;
++        if (std.mem.eql(f32, x.host[0..n], x.want[0..n])) return;
++        @memcpy(x.host[0..n], x.want[0..n]);
++        try prompt.upload(e, x.mask, &x.host, n * 4);
++    }
++
++    /// A prompt chunk of n rows of one stream: all edited or all stock.
++    pub fn maskChunk(x: *Abl, e: *const prompt.Engine, n: usize, on: bool) !void {
++        @memset(x.want[0..n], if (on) 1 else 0);
++        try x.push(e, n);
++    }
++
++    /// A round's rows: row i edited when its stream's slot is (steer[slot] != 0).
++    pub fn maskRows(x: *Abl, e: *const prompt.Engine, slots: []const i64, steer: []const u8) !void {
++        for (slots, 0..) |s, i| x.want[i] = if (s >= 0 and s < steer.len and steer[@intCast(s)] != 0) 1 else 0;
++        try x.push(e, slots.len);
++    }
++
++    pub fn load(d: anytype, io: std.Io, a: std.mem.Allocator, path: []const u8, hidden: usize) !Abl {
++        const b = try std.Io.Dir.cwd().readFileAllocOptions(io, path, a, .limited(1 << 26), .@"4", null);
++        if (b.len < 12 or !std.mem.eql(u8, b[0..4], "ABL1")) return error.BadAblitFile;
++        const h = std.mem.readInt(u32, b[4..8], .little);
++        const n: usize = std.mem.readInt(u32, b[8..12], .little);
++        if (h != hidden) return error.AblitHiddenMismatch;
++        const rec = 8 + hidden * 4;
++        if (b.len != 12 + n * rec) return error.BadAblitFile;
++        const dir_bytes = n * hidden * 4;
++        var x: Abl = .{ .buf = try cuda.DeviceBuffer.alloc(d, dir_bytes + 3 * max_rows * 4) };
++        errdefer x.buf.free();
++        for (0..n) |i| {
++            const p = b[12 + i * rec ..][0..rec];
++            const l = std.mem.readInt(u32, p[0..4], .little);
++            if (l >= max_layers) return error.BadAblitLayer;
++            x.lam[l] = @bitCast(std.mem.readInt(u32, p[4..8], .little));
++            try x.buf.upload(i * hidden * 4, p[8..]);
++            x.dirs[l] = x.buf.ptr + i * hidden * 4;
++            std.debug.print("ablit: layer {d} lam {d:.3}\n", .{ l, x.lam[l] });
++        }
++        x.t = x.buf.ptr + dir_bytes;
++        x.ts = x.t + max_rows * 4;
++        x.mask = x.ts + max_rows * 4;
++        const ones: [max_rows]f32 = @splat(1);
++        try x.buf.upload(dir_bytes + 2 * max_rows * 4, std.mem.sliceAsBytes(&ones));
++        return x;
++    }
++
++    pub fn deinit(x: *Abl) void {
++        x.buf.free();
++    }
++
++    /// The edit on rows [0, rows) of y fp32 [rows, hidden], when layer li has a direction.
++    pub fn apply(x: *const Abl, e: *const prompt.Engine, y: u64, rows: usize, li: usize) !void {
++        if (li >= max_layers or x.dirs[li] == 0) return;
++        if (rows > max_rows) return error.AblitRows;
++        try e.blas.xv(y, x.dirs[li], x.t, rows, e.c.hidden);
++        try e.blas.dgmmRows(x.t, x.mask, x.ts, rows);
++        try e.blas.rank1(x.dirs[li], x.ts, y, e.c.hidden, rows, -x.lam[li]);
++    }
++};
+diff --git a/zig/src/families/dsv41/cublas.zig b/zig/src/families/dsv41/cublas.zig
+index 0411372..8ce5885 100644
+--- a/zig/src/families/dsv41/cublas.zig
++++ b/zig/src/families/dsv41/cublas.zig
+@@ -22,6 +22,7 @@ pub const Api = struct {
+     cublasSetWorkspace_v2: *const fn (Handle, D, usize) callconv(.c) S,
+     cublasSetMathMode: *const fn (Handle, c_int) callconv(.c) S,
+     cublasSgemm_v2: *const fn (Handle, Op, Op, c_int, c_int, c_int, *const f32, D, c_int, D, c_int, *const f32, D, c_int) callconv(.c) S,
++    cublasSdgmm: *const fn (Handle, c_int, c_int, c_int, D, c_int, D, c_int, D, c_int) callconv(.c) S,
+     cublasGemmEx: *const fn (Handle, Op, Op, c_int, c_int, c_int, *const anyopaque, D, c_int, c_int, D, c_int, c_int, *const anyopaque, D, c_int, c_int, c_int, c_int) callconv(.c) S,
+ };
+ 
+@@ -90,4 +91,15 @@ pub const Blas = struct {
+         const zero: f32 = 0;
+         try b.check(b.api.cublasSgemm_v2(b.handle, .n, .n, 1, @intCast(rows), @intCast(k), &one, v, 1, x, @intCast(k), &zero, out, 1));
+     }
++
++    /// out[i] = t[i] * m[i] for i < rows (cublasSdgmm, side left, an n = 1 matrix). abl.zig.
++    pub fn dgmmRows(b: *const Blas, t: u64, m: u64, out: u64, rows: usize) Error!void {
++        try b.check(b.api.cublasSdgmm(b.handle, 0, @intCast(rows), 1, t, @intCast(rows), m, 1, out, @intCast(rows)));
++    }
++
++    /// y [rows, k] fp32 row-major += alpha * t[rows] (outer) r[k]: column-major C [k, rows] += alpha * r [k, 1] t^T [1, rows]. abl.zig.
++    pub fn rank1(b: *const Blas, r: u64, t: u64, y: u64, k: usize, rows: usize, alpha: f32) Error!void {
++        const one: f32 = 1;
++        try b.check(b.api.cublasSgemm_v2(b.handle, .n, .n, @intCast(k), @intCast(rows), 1, &alpha, r, @intCast(k), t, 1, &one, y, @intCast(k)));
++    }
+ };
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 8754ddc..a8601b2 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -525,8 +525,10 @@ pub const Lanes = struct {
+             try self.wire.int(gpa, u32, @intCast(slot));
+             try self.wire.int(gpa, u64, base);
+             try self.wire.ids(gpa, seq.items);
++            try self.wire.int(gpa, u8, s.steer);
+             try self.flush();
+         }
++        m.setSteer(slot, s.steer);
+         try m.fillBegin(slot, base);
+         if (spans.items.len > 0) {
+             // the spans and their rows, image_piece bytes of rows a frame (a follower's frame buffer holds 64 KiB and
+@@ -991,6 +993,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+                 if (slot >= max_streams) return error.BadSlot;
+                 img_rows.clearRetainingCapacity();
+                 try r.ids(gpa, &seqs[slot]);
++                m.setSteer(slot, try r.int(u8));
+                 m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
+                 m.fill_seq = seqs[slot].items;
+             },
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 3db2f5b..000128f 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -23,6 +23,7 @@ const exl3_experts = @import("exl3_experts.zig");
+ const ops_mod = @import("ops.zig");
+ const exact = @import("exact.zig");
+ const cublas = @import("cublas.zig");
++const abl_mod = @import("abl.zig");
+ const comm_mod = @import("comm.zig");
+ const link = @import("link.zig");
+ const ring2d = @import("ring2d.zig");
+@@ -138,6 +139,8 @@ pub const Model = struct {
+     ch: prompt.Chunk,
+     caches: prompt.Caches,
+     blas: cublas.Blas,
++    abl: ?abl_mod.Abl = null, // TF_ABLIT (abl.zig)
++    steer: [max_streams]u8 = @splat(0), // a slot's stream: 1 edited (abl.zig), 0 stock
+     rings: []u64, // each layer's window rings, max_streams slots
+     ring_view: []u64, // a filling stream's slot of them
+     rd: round.Round,
+@@ -193,6 +196,8 @@ pub const Model = struct {
+         errdefer gpa.destroy(m);
+         m.* = undefined;
+         m.gpa = gpa;
++        m.abl = null;
++        m.steer = @splat(0);
+         if (std.c.getenv("TF_DS_REPLAY_FLOOR")) |v| prompt.replay_floor = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
+         prompt.short_continuation_gather = if (std.c.getenv("TF_DS_CACHE_SHORT_CONTINUATION")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false; // same opt-in on every rank
+         m.spans = .empty;
+@@ -328,6 +333,11 @@ pub const Model = struct {
+         m.blas = try cublas.Blas.open(m.stream, m.ch.blas_ws);
+         errdefer m.blas.close();
+         m.eng.blas = &m.blas;
++        if (std.c.getenv("TF_ABLIT")) |p| {
++            m.abl = try abl_mod.Abl.load(d, io, a, std.mem.span(p), c.hidden);
++            m.eng.abl = &m.abl.?;
++        }
++        errdefer if (m.abl) |*x| x.deinit();
+         m.rings = try a.alloc(u64, c.layers);
+         m.ring_view = try a.alloc(u64, c.layers);
+         for (m.rings) |*r| {
+@@ -410,6 +420,7 @@ pub const Model = struct {
+         if (m.tables) |*t| t.close();
+         if (m.rdma_rings) |*r| r.close(m.gpa);
+         m.blas.close();
++        if (m.abl) |*x| x.deinit();
+         m.arena.deinit();
+         m.rope_buf.free();
+         m.ex.unload();
+@@ -605,6 +616,11 @@ pub const Model = struct {
+         m.ch.img_rows = if (m.img_buf) |b| b.ptr else 0;
+     }
+ 
++    /// The stream in `slot` is edited (1) or stock (0): rank 0 from the request, the followers from fill_begin.
++    pub fn setSteer(m: *Model, slot: usize, v: u8) void {
++        if (slot < max_streams) m.steer[slot] = v;
++    }
++
+     pub fn fillBegin(m: *Model, slot: usize, base: usize) !void {
+         if (slot >= m.streams) return error.BadSlot;
+         m.spans.clearRetainingCapacity();
+@@ -621,6 +637,7 @@ pub const Model = struct {
+     pub fn fillChunk(m: *Model, seq: []const i32, start: usize, n: usize, replay: usize) !bool {
+         if (n == 0 or n > chunk_rows or seq.len != start + n) return error.BadChunk;
+         const e = &m.eng;
++        if (m.abl) |*x| try x.maskChunk(e, n, m.steer[m.fill_slot] != 0);
+         const c = e.c;
+         const ch = &m.ch;
+         // an image position's id is negative in the sequence (its n-grams dead for Engram): its embedding's id is the
+@@ -739,6 +756,7 @@ pub const Model = struct {
+     pub fn verify(m: *Model, rows: round.Rows, absorb: []const bool) !void {
+         const e = &m.eng;
+         if (m.prof) try m.stream.synchronize(); // (the GPU idle, so the issue time shows whether the host keeps it fed)
++        if (m.abl) |*x| if (rows.slots) |sl| try x.maskRows(e, sl, &m.steer) else try x.maskChunk(e, rows.ids.len, m.steer[0] != 0);
+         const t0 = m.now();
+         try round.forward(e, &m.rd, &m.ch, &m.caches, m.rings, if (m.eh) |*x| x else null, &.{}, rows, m.pool_cap, null, if (m.graphs) |*g| g else null);
+         if (m.prof) {
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index 9f5b5d9..44d154f 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -25,6 +25,7 @@ const exl3_experts = @import("exl3_experts.zig");
+ const exl3_experts2d = @import("exl3_experts2d.zig");
+ const ops = @import("ops.zig");
+ const cublas = @import("cublas.zig");
++const abl = @import("abl.zig");
+ const comm = @import("comm.zig");
+ const engram = @import("engram.zig");
+ const engram_io = @import("engram_io.zig");
+@@ -125,6 +126,7 @@ pub const Engine = struct {
+     round_rows: usize = 16, // a concurrent round's rows at most (TF_DS_ROUND_ROWS; round.max_rows at most)
+     two: ?*const prompt2d.Two = null, // a node of the four-node 2D split (prompt2d.zig); `world` stays TP2's
+     ring: ?*rdma.Ring = null, // TP2: the decode-size all-gathers over the RDMA ring (the served lane's), else NCCL
++    abl: ?*const abl.Abl = null, // TF_ABLIT: the run-time wo_b edit (abl.zig)
+ 
+     /// A decode-size all-gather of `count` fp32 a rank into `dst`, rank after rank: the RDMA ring when the engine has
+     /// one and the slice fits a slot (whole float4s), else NCCL. The same bytes either way.
+@@ -856,6 +858,7 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
+     }
+     if (e.two) |t| return t.woB(e, ch, lay); // 2D: the column partner's groups first, then this pair's columns
+     try mm(e, ch, lay.wo_b, ch.u, uw, ch.pa, .fp32, c.hidden);
++    if (e.abl) |x| try x.apply(e, ch.pa, n, li);
+ }
+ 
+ /// kv_source_update of a kv-source layer on the chunk (no earlier pending row: a chunk starting on a group boundary):
+diff --git a/zig/src/families/dsv41/round.zig b/zig/src/families/dsv41/round.zig
+index bec4277..23dd70c 100644
+--- a/zig/src/families/dsv41/round.zig
++++ b/zig/src/families/dsv41/round.zig
+@@ -724,6 +724,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches,
+     try rd.mark(e, .a_x);
+     var cb_call = [_]exl3_linear.Call{.{ .layer = lay.wo_b, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = rd.xb, .y = rd.pa, .ldy = @intCast(lay.wo_b.n), .y_dtype = .f32, .counters = 0 }};
+     try prompt.groupedRotated(e, ch, R, &cb_call);
++    if (e.abl) |x| try x.apply(e, rd.pa, R, li);
+     // the prefetch behind wo_b: the ffn mix's weights, the router, the shared expert's gate
+     try rd.prefetch(e, &.{ .{ lay.hc_ffn[0], hcFnBytes(c) }, .{ lay.gate_w, @as(u64, c.experts) * c.hidden * 2 }, lay.experts.shared_gate, lay.experts.shared_up, lay.experts.shared_down }, prefetch_budget / 2);
+ }
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 655df22..309842e 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -22,6 +22,7 @@ pub const Prompt = union(enum) { text: []const u8, ids: []const u32 };
+ /// What a route hands the reply: Python's chat() arguments.
+ pub const Input = struct {
+     cache_namespace: ?[32]u8 = null,
++    steer: u8 = 0, // abl.zig: from the model id or the "ablit" field (openai.steerFor)
+     messages: Value = .{ .array = &.{} },
+     tools: []const Value = &.{},
+     prompt: ?Prompt = null,
+@@ -177,6 +178,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+     var request: api.Request = .{
+         .prompt = rendered.ids,
+         .cache_namespace = input.cache_namespace,
++        .steer = input.steer,
+         .images = rendered.images,
+         .max_tokens = @intCast(@min(limit, std.math.maxInt(u32))),
+         .sampling = sampling,
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index 4d8d872..1e6c79a 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -106,6 +106,24 @@ pub fn replyModel(srv: *const Server, body: Value) []const u8 {
+     return srv.config.served_name;
+ }
+ 
++/// The run-time edit for a request (dsv41 abl.zig, TF_ABLIT): TF_ABLIT_DEFAULT=1 edits by default; the ids
++/// "<served>-ablit" and "<served>-stock" and a boolean "ablit" field choose per request.
++fn steerFor(srv: *const Server, body: Value) u8 {
++    if (std.c.getenv("TF_ABLIT") == null) return 0;
++    var v: u8 = if (std.c.getenv("TF_ABLIT_DEFAULT")) |d| @intFromBool(d[0] == '1') else 0;
++    if (body.get("model")) |m| if (m == .string) {
++        const n = srv.config.served_name;
++        if (m.string.len > n.len and std.mem.startsWith(u8, m.string, n)) {
++            const tail = m.string[n.len..];
++            if (std.mem.eql(u8, tail, "-ablit")) v = 1 else if (std.mem.eql(u8, tail, "-stock")) v = 0;
++        }
++    };
++    if (body.get("ablit")) |b| if (b == .bool) {
++        v = @intFromBool(b.bool);
++    };
++    return v;
++}
++
+ const Plan = struct {
+     input: chat.Input,
+     stream: bool,
+@@ -127,6 +145,12 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
+         if (!srv.info.cache_salt) return cx.refuse("this engine does not support cache_salt");
+         input.cache_namespace = @import("engine_api").prompt_cache.namespaceFor(salt.string);
+     };
++    input.steer = steerFor(srv, body);
++    if (input.steer != 0) { // an edited request's cached prefixes are its own (its KV differs from stock's)
++        var ns: [32]u8 = input.cache_namespace orelse @splat(0);
++        for (&ns, 0..) |*b, i| b.* ^= @as(u8, @truncate(0xA5 + i * 7));
++        input.cache_namespace = ns;
++    }
+     // an engine with vision takes image parts: their placeholders in the text, their bytes in input.images
+     var images: messages.Images = .{ .placeholder = if (srv.info.vision) |v| v.placeholder else "" };
+     const take: ?*messages.Images = if (srv.info.vision != null) &images else null;
+diff --git a/zig/src/server/serve.zig b/zig/src/server/serve.zig
+index fe3d03a..3531e0c 100644
+--- a/zig/src/server/serve.zig
++++ b/zig/src/server/serve.zig
+@@ -101,6 +101,9 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+             if (std.mem.eql(u8, seen, id)) break;
+         } else ids.append(a, id) catch return 1;
+     };
++    if (std.c.getenv("TF_ABLIT") != null) for ([_][]const u8{ "-ablit", "-stock" }) |tail| {
++        ids.append(a, std.mem.concat(a, u8, &.{ s.served, tail }) catch return 1) catch return 1;
++    };
+     const salt = if (env(s, "TENSORFOLD_SEED_SALT")) |t| std.fmt.parseInt(i64, std.mem.trim(u8, t, " "), 10) catch {
+         std.debug.print("tensorfold: TENSORFOLD_SEED_SALT={s}: an integer\n", .{t});
+         return 1;

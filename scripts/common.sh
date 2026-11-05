@@ -49,6 +49,9 @@ copy_to() {
 # tree_sum R DIR: one digest over every file's sha256 under DIR on rank R (relative paths)
 tree_sum() { on "$1" "cd '$2' && find . -type f ! -name '*.partial' -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16"; }
 
+# The abliteration's direction file name (scripts/ablit.sh writes it; each rank reads it from rt/ablit/)
+ablit_file() { echo "abl-L$(echo "$ABLIT_LAYERS" | tr ' ,' '__')-l$ABLIT_LAMBDA.bin"; }
+
 # The rank processes and their logs
 pattern() { echo "[t]ensorfold-native serve ${RT[$1]}/|[t]f-dsv41-lanes ${RT[$1]}/"; }
 running() { on "$1" "pgrep -f '$(pattern "$1")' >/dev/null"; }
@@ -94,6 +97,8 @@ PY
       "# run_rank.sh: rank $r of DeepSeek-V4.1-Flash-1017 EXL3 3.5 bpw on TensorFold TP3 (written by the recipe's scripts)." \
       "RT=${RT[$r]}; mkdir -p \$RT/logs" \
       "echo \"\$(date '+%F %T') start rank $r\" >> \$RT/logs/rank$r.log" \
+      "${NCCL_ENV:+export $NCCL_ENV}" "${RANK_ENV:+export $RANK_ENV}" \
+      "$([ "$ABLIT" = 1 ] && echo "export TF_ABLIT=${RT[$r]}/ablit/$(ablit_file) TF_ABLIT_DEFAULT=$ABLIT_DEFAULT")" \
       "exec python3 -I \$RT/launcher/launch.py --config \$RT/launcher/cluster.json --variant $ARM --rank $r --run >> \$RT/logs/rank$r.log 2>&1" \
       > "$WORK/run_rank-$r.sh"
     if [ $r = 0 ]; then

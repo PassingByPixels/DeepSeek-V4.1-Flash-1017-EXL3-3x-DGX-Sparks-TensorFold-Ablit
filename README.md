@@ -1,4 +1,14 @@
-# DeepSeek-V4.1-Flash-1017 EXL3 3.5 bpw on 3× DGX Spark with TensorFold
+# DeepSeek-V4.1-Flash-1017 EXL3 3.5 bpw on 3× DGX Spark with TensorFold — stock and abliterated on one server
+
+> **This is a fork** of [easthambuilds' 3-Spark recipe](https://github.com/easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-3x-DGX-Sparks-TensorFold)
+> (`7d72d1e`). It adds one thing: **stock and abliterated replies from the same server, chosen per request**
+> (`ABLIT=1`, [below](#stock-and-abliterated-on-one-server)), with
+> [drowzeys' Keys abliteration](https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated) applied at run time
+> instead of baked into the weights. It also carries two setup fixes for four-rail triangles (upstream issues
+> [#1](https://github.com/easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-3x-DGX-Sparks-TensorFold/issues/1) and
+> [#2](https://github.com/easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-3x-DGX-Sparks-TensorFold/issues/2)) and a readahead
+> check. With `ABLIT=0` (the default) it serves exactly what the donor recipe serves. The rest of this README is the
+> donor's, with these changes marked.
 
 Serve [**DeepSeek-V4.1-Flash-1017**](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) from three NVIDIA DGX
 Sparks (GB10, 128 GB each, cabled to each other by their ConnectX-7 ports) through an OpenAI-compatible API, with
@@ -25,6 +35,71 @@ for [TensorFold](https://github.com/ashhart/TensorFold). What is ours:
 | RoPE tables | the runtime's `make_rope.py` on CPU in `nvcr.io/nvidia/pytorch:26.07-py3`, cut to the pool |
 | API | `http://127.0.0.1:8888/v1`, model id `deepseek-v4.1-flash` |
 | Defaults | pool 4,000,000 tokens, 401,408 tokens per request, 12 streams, 2 GiB prompt cache, the server's default reasoning effort |
+
+## Stock and abliterated on one server
+
+With `ABLIT=1` in `scripts/local.sh`, one server answers both ways, request by request:
+
+| Request | Reply |
+|---|---|
+| `"model": "<SERVED_NAME>-stock"` | stock |
+| `"model": "<SERVED_NAME>-ablit"` | abliterated |
+| `"model": "<SERVED_NAME>"` | `ABLIT_DEFAULT`: 1 abliterated (default), 0 stock |
+| any of these plus `"ablit": true` or `false` | that mode |
+
+`/v1/models` lists all three ids. Two clients can use different modes at the same time: the requests share the
+batch, and each row gets its own mode. An abliterated request never reuses a stock request's cached prompt (its KV
+differs from layer 18 on), and the other way round.
+
+**Before you set `ABLIT=1`:** the overlay repository is gated. Accept its terms on the Hub
+([drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated](https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated),
+including its Responsible Use agreement) with the account of the HF token on the head. The recipe downloads it with
+that token; it does not ship any part of it.
+
+### How it works
+
+drowzeys' overlay changes `attn.wo_b` of layers 10–35 as `W' = W − λ r rᵀ W`: one refusal direction `r` in the
+5120-wide hidden state, λ = 3.5. Because the change is rank 1, the runtime can make the same change to `wo_b`'s
+output instead of to its weights: `y ← y − λ · mask[row] · (r · y) r`, with `mask[row]` 1 on the rows of an abliterated
+request and 0 on a stock one. Each rank applies it to its own fp32 partial before the all-gather; the edit is linear,
+so the sum gets the same edit. It costs three small cuBLAS calls a layer, inside the CUDA graphs.
+
+`scripts/ablit.sh` (run by `start.sh` and `prepare.sh`, ranks stopped) does the setup once:
+
+1. downloads the overlay's FP8 sidecar `wo_b_l10_35_1017.safetensors` at a pinned revision (`hub_fetch.py`, sha256
+   checked) and the stock FP8 `wo_b` of `ABLIT_LAYERS` from DeepSeek's checkpoint by range requests (~42 MB a layer,
+   `tools/ablit_fetch.py`);
+2. works out `r` in the RoPE step's PyTorch image (`tools/ablit_direction.py`, no network): the top singular vector of
+   each layer's difference, averaged. It stops unless every difference is rank 1 (σ1/σ2 ≥ 8; measured 14–17) and
+   every layer gives the same direction (cosine ≥ 0.999; measured ≥ 0.9998);
+3. builds the runtime with `ablit/ablit-runtime.patch` (Apache-2.0, like the TensorFold sources it changes; summary at
+   its top) into `$DATA_DIR/build-ablit`, and puts those binaries and the direction file on all three ranks.
+
+`ABLIT=0` puts the recipe's own binaries back. Settings: `ABLIT`, `ABLIT_DEFAULT`, `ABLIT_LAYERS` (default `18-25`;
+the overlay covers 10–35), `ABLIT_LAMBDA` (default 3.5). A new layer set or λ is a new direction file and a
+restart, no re-export of the rank caches.
+
+### Measured (our three Sparks, 4K-page kernels, `ALLOW_4K_PAGES=1`, GPU clocks capped at 2,000 MHz)
+
+| | stock | abliterated, run-time L18-25 |
+|---|---|---|
+| Refusals, 24 dual-use prompts (`ablit/eval/gate.py`) | 18/24 | 0/24 |
+| Refusals, 36 held-out prompts (`refuse2.py`) | 27/36 | 0/36 |
+| MMLU-Pro, 240 questions, thinking off (`mmlu.py`) | 0.787 | 0.796 |
+| GSM8K, 120 questions (`eval2.py`) | 116 | 117 |
+| Decode, 1 / 4 / 8 streams (tok/s) | 70.0 / 135.1 / 175.2 | 70.5 / 136.5 / 175.6 |
+
+- **Stock mode is unchanged by the patch:** 24/24 greedy replies byte-identical to the unpatched engine.
+- **Mixed batches:** stock and abliterated requests at the same time give each mode's own refusal counts (18/24 and
+  0/24); greedy text matched the solo runs on 23-24 of 24 prompts (batched decode is not bit-exact, in stock mode too).
+- **Prompt cache:** stock, ablit, ablit, stock on one 7.8K-token prefix gave cached tokens 0, 0, 7,831, 7,831.
+- **Why layers 18–25:** we baked layer subsets of the overlay into rank caches and measured each. The full overlay
+  (10–35) costs capability (MMLU-Pro 0.750: paired against stock it lost 15 questions and gained 6). Every subset that
+  starts at layer 18 lost 5 and gained 8. 18–25 is the smallest that keeps 0/60 refusals; 18–23 and 22–27 let one
+  prompt refuse again.
+- The refusal sets detect a bypass (a regex on the first 400 characters of the reply); they are not a safety benchmark.
+- Only the OpenAI routes read the mode (`/v1/chat/completions`, tested; `/v1/completions` shares its code). The
+  Anthropic and Responses routes do not, so they probably give stock replies (untested).
 
 ## Results
 
@@ -75,6 +150,15 @@ byte-identical to the hand-built ones the numbers above were measured on; their 
 - **Disk:** on the head, ~720 GB under `DATA_DIR` at the peak of the setup (checkpoint ~253 GB, Engram source
   ~203 GB, three rank caches ~86 GB each before two of them move, Engram cut ~68 GB, kit and RoPE ~8 GB); ~400 GB
   after. On the other two, ~160 GB each.
+- **Readahead (this fork):** the runtime loads its rank cache with buffered reads, which the default 128 KB
+  readahead caps at ~1 GB/s. With 4 MB the load took 79 s instead of 140 s on our Sparks (one of them lost the most at
+  128 KB). `start.sh` warns below 1 MB. To set it on each Spark, until reboot and then permanent:
+  `echo 4096 | sudo tee /sys/block/nvme0n1/queue/read_ahead_kb`, and a udev rule
+  `ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/read_ahead_kb}="4096"` in
+  `/etc/udev/rules.d/60-nvme-readahead.rules`.
+- **NCCL on four rails (this fork):** with both halves of each cable addressed, NCCL gets one HCA per peer
+  (`tools/topology.py`, [#2](https://github.com/easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-3x-DGX-Sparks-TensorFold/issues/2)),
+  and every rank runs with `NCCL_SWITCHLESS_RING_ONLY=1 NCCL_ALGO=Ring` (`NCCL_ENV`; more in `RANK_ENV`).
 - **Same GPU clock cap on all three** if you compare numbers: the ranks wait for each other every step, so the
   slowest clock sets the pace. We use `sudo nvidia-smi -lgc 0,2000`.
 
@@ -83,8 +167,8 @@ byte-identical to the hand-built ones the numbers above were measured on; their 
 On the head:
 
 ```bash
-git clone https://github.com/easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-3x-DGX-Sparks-TensorFold.git
-cd DeepSeek-V4.1-Flash-1017-EXL3-3x-DGX-Sparks-TensorFold
+git clone https://github.com/PassingByPixels/DeepSeek-V4.1-Flash-1017-EXL3-3x-DGX-Sparks-TensorFold-Ablit.git
+cd DeepSeek-V4.1-Flash-1017-EXL3-3x-DGX-Sparks-TensorFold-Ablit
 cp scripts/local.sh.example scripts/local.sh   # WORKER1, WORKER2
 DRY_RUN=1 ./start.sh                            # checks the Sparks, cables and routes; changes nothing
 ./start.sh
@@ -158,6 +242,12 @@ match its pinned source exactly once:
 
 ## Credits
 
+- **[easthambuilds](https://github.com/easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-3x-DGX-Sparks-TensorFold):** the
+  recipe this fork is built on: the checkpoint, the plan, the setup and everything not listed under this fork's changes.
+- **[drowzeys](https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated):** the Keys abliteration
+  of DeepSeek-V4.1-Flash-1017 (MIT, gated with a Responsible Use agreement) whose direction the run-time edit applies.
+  Used with drowzeys' agreement; the recipe fetches it with your own accepted token.
+
 - **[DeepSeek](https://huggingface.co/deepseek-ai):** DeepSeek-V4.1-Flash-1017 (MIT).
 - **[LakyFx](https://github.com/LakyFx):** the TensorFold TP3 runtime for three DGX Sparks (MIT): its launcher,
   exporter, Engram and RoPE tools, profiles and kernel kit, used as published apart from the two changes above; and the
@@ -178,5 +268,7 @@ Not affiliated with or endorsed by DeepSeek, NVIDIA, LakyFx, the TensorFold auth
 
 ## License
 
-Apache-2.0 for the scripts and tools in this repository (`LICENSE`). The checkpoint, runtime, NCCL build and
+Apache-2.0 for the scripts and tools in this repository (`LICENSE`), including this fork's changes
+(`scripts/ablit.sh`, `tools/ablit_*.py`, `ablit/`, and the edits listed at the top). `ablit/ablit-runtime.patch` changes
+Apache-2.0 TensorFold sources and is Apache-2.0. The abliteration overlay keeps its own license and terms. The checkpoint, runtime, NCCL build and
 DeepSeek's weights keep their own licenses.
