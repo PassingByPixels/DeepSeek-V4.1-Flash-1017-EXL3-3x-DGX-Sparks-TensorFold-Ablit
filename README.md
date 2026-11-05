@@ -97,6 +97,9 @@ restart, no re-export of the rank caches.
   (10–35) costs capability (MMLU-Pro 0.750: paired against stock it lost 15 questions and gained 6). Every subset that
   starts at layer 18 lost 5 and gained 8. 18–25 is the smallest that keeps 0/60 refusals; 18–23 and 22–27 let one
   prompt refuse again.
+- **What was tested:** on our three Sparks, from an already set-up `DATA_DIR`: `scripts/ablit.sh` from nothing
+  (download, direction, build, deploy), `ABLIT=0` and `ABLIT=1` starts, the dry-run preflight. A first-time setup of
+  new Sparks with this fork has not been run end to end.
 - The refusal sets detect a bypass (a regex on the first 400 characters of the reply); they are not a safety benchmark.
 - Only the OpenAI routes read the mode (`/v1/chat/completions`, tested; `/v1/completions` shares its code). The
   Anthropic and Responses routes do not, so they probably give stock replies (untested).
