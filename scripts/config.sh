@@ -51,6 +51,9 @@ ABLIT_LAMBDA=${ABLIT_LAMBDA:-3.5}     # edit strength (the overlay's)
 ABLIT_REPO=drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated
 ABLIT_REV=de412d2249632903dace23399526e00a145aada5
 ABLIT_SIDECAR=wo_b_l10_35_1017.safetensors
+# With ABLIT=1 (the patched runtime): a decode round of the other streams between a long prompt's chunks, so a prompt
+# being read does not stop everyone else (TF_DS_PREFILL_YIELD, ported from Mia's AI Lab 0023). 0: whole prompt first.
+PREFILL_YIELD=${PREFILL_YIELD:-1}
 
 # NCCL on a switchless triangle: the switchless build's ring mode (README, Requirements). RANK_ENV: anything else to
 # export to every rank (e.g. NCCL_DEBUG=INFO).

@@ -79,6 +79,20 @@ so the sum gets the same edit. It costs three small cuBLAS calls a layer, inside
 the overlay covers 10–35), `ABLIT_LAMBDA` (default 3.5). A new layer set or λ is a new direction file and a
 restart, no re-export of the rank caches.
 
+### A long prompt no longer stops the others (`PREFILL_YIELD`, on with `ABLIT=1`)
+
+The served runtime reads a new prompt to the end before any other stream decodes again. With the patched runtime
+(`ABLIT=1`) the fork also carries Mia's AI Lab's prefill yield (their patch `0023`, ported): a decode round of the
+live streams between the prompt's 2,048-token chunks. Measured here, three streams decoding while a 102,939-token
+prompt is read:
+
+| `PREFILL_YIELD` | longest pause of the other streams | the prompt's time to its reply |
+|---|---|---|
+| `0` (served behaviour) | 56.3 s | 56.6 s |
+| `1` (default with `ABLIT=1`) | 2.8 s | 67.3 s (+19 %) |
+
+Same reply either way. `PREFILL_YIELD=0` in `scripts/local.sh` turns it off.
+
 ### Measured (our three Sparks, 4K-page kernels, `ALLOW_4K_PAGES=1`, GPU clocks capped at 2,000 MHz)
 
 | | stock | abliterated, run-time L18-25 |

@@ -98,7 +98,7 @@ PY
       "RT=${RT[$r]}; mkdir -p \$RT/logs" \
       "echo \"\$(date '+%F %T') start rank $r\" >> \$RT/logs/rank$r.log" \
       "${NCCL_ENV:+export $NCCL_ENV}" "${RANK_ENV:+export $RANK_ENV}" \
-      "$([ "$ABLIT" = 1 ] && echo "export TF_ABLIT=${RT[$r]}/ablit/$(ablit_file) TF_ABLIT_DEFAULT=$ABLIT_DEFAULT")" \
+      "$([ "$ABLIT" = 1 ] && echo "export TF_ABLIT=${RT[$r]}/ablit/$(ablit_file) TF_ABLIT_DEFAULT=$ABLIT_DEFAULT TF_DS_PREFILL_YIELD=$PREFILL_YIELD")" \
       "exec python3 -I \$RT/launcher/launch.py --config \$RT/launcher/cluster.json --variant $ARM --rank $r --run >> \$RT/logs/rank$r.log 2>&1" \
       > "$WORK/run_rank-$r.sh"
     if [ $r = 0 ]; then
