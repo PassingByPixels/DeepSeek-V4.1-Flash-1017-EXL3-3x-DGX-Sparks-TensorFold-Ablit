@@ -91,7 +91,16 @@ prompt is read:
 | `0` (served behaviour) | 56.3 s | 56.6 s |
 | `1` (default with `ABLIT=1`) | 2.8 s | 67.3 s (+19 %) |
 
-Same reply either way. `PREFILL_YIELD=0` in `scripts/local.sh` turns it off.
+Same reply either way. With it, the host also reads prompts one chunk per turn, rotating between them (Mia's AI Lab
+`0031` by Mauvis Ledford, and `0032`, ported), so a request that arrives during a long prompt starts at once:
+
+| A ~100k-token prompt is being read; 5 s later | before | now |
+|---|---|---|
+| a short request's reply | 57.6 s | 0.6 s |
+| an image request's reply | (same wait) | 2.2 s, correct |
+| the long prompt's own reply | 62.6 s | 62.4 s |
+
+`PREFILL_YIELD=0` in `scripts/local.sh` turns both off.
 
 ### Measured (our three Sparks, 4K-page kernels, `ALLOW_4K_PAGES=1`, GPU clocks capped at 2,000 MHz)
 

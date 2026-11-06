@@ -9,6 +9,9 @@ extract.py into $DATA_DIR/build/source). Apache-2.0, like the TensorFold sources
   - core lane_host/lanes stream, dsv41 lanes.zig: TF_DS_PREFILL_YIELD=1 runs a decode round of the live streams
     between a prompt's chunks, so a long prompt no longer stops everyone else's decode. Ported from Mia's AI Lab
     patch 0023 (Track D) of MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold (Apache-2.0).
+  - core lane_host/lanes engine+backend, native cuda, dsv41 lanes.zig: with TF_DS_PREFILL_YIELD=1 a prompt is read one
+    chunk per host turn (prefillStep), rotating between admitted prompts, so a request that arrives during a long
+    prompt starts at once. Ported from Mia's AI Lab patches 0031 (Mauvis Ledford) and 0032, same repository.
 git apply skips these lines.
 
 diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
@@ -25,20 +28,29 @@ index 6901d9f..67f7ab7 100644
      images: []const Image = &.{},
      max_tokens: u32,
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
-index b65b456..0efd135 100644
+index b65b456..1643247 100644
 --- a/zig/src/core/lane_host.zig
 +++ b/zig/src/core/lane_host.zig
-@@ -47,6 +47,9 @@ pub const LaneHost = struct {
+@@ -47,6 +47,10 @@ pub const LaneHost = struct {
      // the request at the queue's front waits for room in the backend's pool (its prompt pass refused ContextFull while
      // other streams ran): admitted again once fewer than this many streams are active
      full_wait: ?usize = null,
 +    // Track D (0023): a round run between an admitting job's prompt chunks failed (its error): once the prompt's pass
 +    // has unwound, every admitted job fails with it, as after any failed round
 +    between_failed: ?[]const u8 = null,
++    fill_next: usize = 0, // 0031: next admitted prompt to advance by one chunk
  
      const Mark = struct { at: i96, tokens: u64 };
      const window_ns: i96 = 2 * std.time.ns_per_s;
-@@ -306,10 +309,74 @@ pub const LaneHost = struct {
+@@ -266,6 +270,7 @@ pub const LaneHost = struct {
+ 
+     /// Sends a stream's new tokens; true once it has finished (its job freed).
+     fn deliver(h: *LaneHost, job: *Job) bool {
++        if (!job.started or job.prefilled == null) return false; // 0031: a prompt still filling has nothing to send
+         h.send(job);
+         if (!job.stream.finished) return false;
+         const reason: Reason = switch (job.stream.reason) {
+@@ -306,10 +311,74 @@ pub const LaneHost = struct {
      }
  
      /// Cancels queued and admitted jobs named since the last round.
@@ -113,7 +125,16 @@ index b65b456..0efd135 100644
          var dropped: std.ArrayList(*Job) = .empty;
          for (ids) |id| {
              for (h.queued.items, 0..) |job, i| if (job.id == id) {
-@@ -330,7 +397,6 @@ pub const LaneHost = struct {
+@@ -322,7 +391,7 @@ pub const LaneHost = struct {
+         dropped.deinit(h.gpa);
+         for (ids) |id| {
+             for (h.admitted.items, 0..) |job, i| if (job.id == id) {
+-                if (!job.stream.finished) h.core.discard(&job.stream);
++                if (job.started and !job.stream.finished) h.core.discard(&job.stream);
+                 h.lock();
+                 _ = h.admitted.orderedRemove(i);
+                 h.unlock();
+@@ -330,7 +399,6 @@ pub const LaneHost = struct {
                  break;
              };
          }
@@ -121,23 +142,37 @@ index b65b456..0efd135 100644
      }
  
      fn lock(h: *LaneHost) void {
-@@ -391,10 +457,12 @@ pub const LaneHost = struct {
-             .reuse = reuse,
-             .prefill_progress = .{ .ptr = job, .at = Job.progress },
-             .images = r.images,
-+            .steer = r.steer,
-         }) catch {
-             job.proposer.deinit();
-             return h.drop(job, "out of memory");
-         };
-+        job.stream.between = .{ .ptr = job, .run = between, .ready = betweenReady };
-         job.started = true;
-         const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
-         job.began = began;
-@@ -413,6 +481,13 @@ pub const LaneHost = struct {
+@@ -349,7 +417,7 @@ pub const LaneHost = struct {
+             return false;
          }
-         if (h.loneFits(job)) return h.runLone(job, began);
-         h.core.addStream(&job.stream) catch |e| {
+         if (h.full_wait) |n| {
+-            const active = h.core.activeCount();
++            const active = if (h.core.fills()) h.admitted.items.len else h.core.activeCount();
+             if (active > 0 and active >= n) {
+                 h.unlock();
+                 return false;
+@@ -363,6 +431,43 @@ pub const LaneHost = struct {
+             return true;
+         };
+         h.unlock();
++        if (h.core.fills()) return true; // 0031: fillOne advances it a chunk at a time
++        if (!h.setup(job)) return true;
++        const began = job.began;
++        h.lock();
++        h.prefill_telemetry.active = 1;
++        h.prefill_rate = 0;
++        h.prefill_telemetry.progress = 0;
++        h.prefill_telemetry.pending = job.request.prompt.len;
++        h.unlock();
++        defer {
++            h.lock();
++            h.prefill_telemetry.active = 0;
++            h.prefill_telemetry.pending = 0;
++            h.unlock();
++            h.noteLive();
++        }
++        if (h.loneFits(job)) return h.runLone(job, began);
++        h.core.addStream(&job.stream) catch |e| {
 +            if (h.between_failed) |msg| {
 +                // a round between this prompt's chunks failed: this job and every admitted one end with its error
 +                h.between_failed = null;
@@ -145,9 +180,189 @@ index b65b456..0efd135 100644
 +                h.failAll(msg);
 +                return true;
 +            }
-             if (e == error.Cancelled) return h.cancel(job);
-             if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
-             return h.drop(job, h.words(e));
++            if (e == error.Cancelled) return h.cancel(job);
++            if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
++            return h.drop(job, h.words(e));
++        };
++        h.prefilled(job, began);
++        if (h.deliver(job)) h.remove(job);
++        return true;
++    }
++
++    /// The job's kept-state lookup and its stream (0031: one engine turn, so another prompt cannot evict the entry
++    /// between). False when the job was dropped.
++    fn setup(h: *LaneHost, job: *Job) bool {
+         const r = job.request;
+         var reuse: lanes.stream.Reuse = .{};
+         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
+@@ -372,7 +477,10 @@ pub const LaneHost = struct {
+             job.marks = l.marks;
+             reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
+         } else |_| {};
+-        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.drop(job, "the drafter could not start");
++        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch {
++            _ = h.drop(job, "the drafter could not start");
++            return false;
++        };
+         job.stream = lanes.Stream.init(h.gpa, .{
+             .id = "request",
+             .prompt = r.prompt,
+@@ -391,35 +499,62 @@ pub const LaneHost = struct {
+             .reuse = reuse,
+             .prefill_progress = .{ .ptr = job, .at = Job.progress },
+             .images = r.images,
++            .steer = r.steer,
+         }) catch {
+             job.proposer.deinit();
+-            return h.drop(job, "out of memory");
++            _ = h.drop(job, "out of memory");
++            return false;
+         };
++        job.stream.between = .{ .ptr = job, .run = between, .ready = betweenReady };
+         job.started = true;
+-        const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
+-        job.began = began;
+-        h.lock();
+-        h.prefill_telemetry.active = 1;
+-        h.prefill_rate = 0;
+-        h.prefill_telemetry.progress = 0;
+-        h.prefill_telemetry.pending = r.prompt.len;
+-        h.unlock();
+-        defer {
++        job.began = std.Io.Clock.awake.now(h.io).toNanoseconds();
++        return true;
++    }
++
++    /// 0031: one chunk per host turn, rotating between the admitted prompts, so a request that arrives can start
++    /// before a long prompt ends, and the live streams' round runs between turns.
++    fn fillOne(h: *LaneHost) void {
++        if (!h.core.fills()) return;
++        const n = h.admitted.items.len;
++        for (0..n) |offset| {
++            const i = (h.fill_next + offset) % n;
++            const job = h.admitted.items[i];
++            if (job.prefilled != null) continue;
++            h.fill_next = i + 1;
++            const first = !job.started;
++            if (first and !h.setup(job)) return;
+             h.lock();
+-            h.prefill_telemetry.active = 0;
+-            h.prefill_telemetry.pending = 0;
++            h.prefill_telemetry.active = 1;
++            h.prefill_telemetry.pending = job.request.prompt.len -| h.prefill_telemetry.progress;
+             h.unlock();
++            const done = h.core.fillStream(&job.stream, first) catch |e| {
++                if (e == error.Cancelled) {
++                    _ = h.cancel(job);
++                } else if (e == error.ContextFull and h.admitted.items.len > 1) {
++                    _ = h.requeue(job);
++                } else {
++                    _ = h.drop(job, h.words(e));
++                }
++                h.lock();
++                h.prefill_telemetry.active = 0;
++                h.unlock();
++                return;
++            };
++            job.reported(); // the first step restored it: no dangling cache entry across another prompt's keep
++            if (done) {
++                h.prefilled(job, job.began);
++                if (h.deliver(job)) h.remove(job);
++            }
+             h.noteLive();
++            return;
+         }
+-        if (h.loneFits(job)) return h.runLone(job, began);
+-        h.core.addStream(&job.stream) catch |e| {
+-            if (e == error.Cancelled) return h.cancel(job);
+-            if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
+-            return h.drop(job, h.words(e));
+-        };
+-        h.prefilled(job, began);
+-        if (h.deliver(job)) h.remove(job);
+-        return true;
++    }
++
++    /// 0031: an admitted prompt still filling.
++    fn filling(h: *const LaneHost) bool {
++        if (!h.core.fills()) return false;
++        for (h.admitted.items) |job| if (job.prefilled == null) return true;
++        return false;
+     }
+ 
+     fn prefilled(h: *LaneHost, job: *Job, began: i96) void {
+@@ -568,6 +703,7 @@ pub const LaneHost = struct {
+             h.takeCancels();
+             h.takeCacheReset();
+             while (h.admitOne()) {}
++            h.fillOne();
+             h.noteLive();
+             h.lock();
+             if (h.closing) {
+@@ -578,7 +714,7 @@ pub const LaneHost = struct {
+                 continue;
+             }
+             if (h.core.activeCount() == 0) {
+-                if (h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes))
++                if (!h.filling() and h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes))
+                     h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
+                 h.unlock();
+                 continue;
+@@ -607,7 +743,7 @@ pub const LaneHost = struct {
+         h.admitted.clearRetainingCapacity();
+         h.unlock();
+         for (jobs) |job| {
+-            if (!job.stream.finished) h.core.discard(&job.stream);
++            if (job.started and !job.stream.finished) h.core.discard(&job.stream);
+             h.finish(job, .failed, message);
+         }
+         h.gpa.free(jobs);
+diff --git a/zig/src/core/lanes/backend.zig b/zig/src/core/lanes/backend.zig
+index 929c5ec..2e1597b 100644
+--- a/zig/src/core/lanes/backend.zig
++++ b/zig/src/core/lanes/backend.zig
+@@ -52,6 +52,8 @@ pub const Backend = struct {
+     pub const VTable = struct {
+         /// Prefill the stream's prompt into its caches (and its draft head's).
+         prefill: *const fn (ptr: *anyopaque, s: *Stream) anyerror!void,
++        /// One bounded prompt step; true once the first token can be drawn, null for whole-pass backends (0031).
++        prefill_step: ?*const fn (ptr: *anyopaque, s: *Stream) anyerror!bool = null,
+         /// Draw the first token from the prompt's last row at `position`; a handle to it.
+         first: *const fn (ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64,
+         /// Feed one token and queue the draw of the next at `position` (a one-token round); a handle to it.
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 1199e77..25f1336 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -83,6 +83,28 @@ pub const Engine = struct {
+             if (err == error.Cancelled) e.backend.release(s); // the host finishes a cancelled stream without the core
+             return err;
+         };
++        try e.prefilled(s);
++    }
++
++    /// Whether this backend can return to admission between prompt chunks (0031).
++    pub fn fills(e: *const Engine) bool {
++        return e.backend.vtable.prefill_step != null;
++    }
++
++    /// One prompt chunk; a completed prompt joins the ordinary lane rounds with the same first-token path (0031).
++    pub fn fillStream(e: *Engine, s: *Stream, first: bool) !bool {
++        _ = e.arena.reset(.retain_capacity);
++        if (first) try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
++        const done = e.backend.vtable.prefill_step.?(e.backend.ptr, s) catch |err| {
++            if (err == error.Cancelled) e.backend.release(s);
++            return err;
++        };
++        if (!done) return false;
++        try e.prefilled(s);
++        return true;
++    }
++
++    fn prefilled(e: *Engine, s: *Stream) !void {
+         if (s.isCancelled()) { // cancelled in its last chunk: no first token
+             e.backend.release(s);
+             return error.Cancelled;
 diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
 index 00caa29..27a7988 100644
 --- a/zig/src/core/lanes/stream.zig
@@ -310,9 +525,18 @@ index 0411372..8ce5885 100644
 +    }
  };
 diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
-index 8754ddc..42bdb80 100644
+index 8754ddc..7be69ce 100644
 --- a/zig/src/families/dsv41/lanes.zig
 +++ b/zig/src/families/dsv41/lanes.zig
+@@ -37,7 +37,7 @@ pub const image_piece = 32 << 10;
+ pub var logits_sha = false;
+ 
+ /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
+-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9 };
++pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_resume = 10 };
+ 
+ /// A frame being written.
+ pub const Wire = struct {
 @@ -192,6 +192,13 @@ pub const Profile = struct {
      prefills: u64 = 0,
  };
@@ -327,7 +551,159 @@ index 8754ddc..42bdb80 100644
  /// A round-cost table "30.0,35.2,..." (TF_DS_ROUND_MS's form): ms by rows from 1.
  pub fn parseMs(a: std.mem.Allocator, text: []const u8) ![]const f64 {
      var out: std.ArrayList(f64) = .empty;
-@@ -525,8 +532,10 @@ pub const Lanes = struct {
+@@ -213,6 +220,21 @@ const Lane = struct {
+     nheld: usize = 0,
+ };
+ 
++/// 0031: a prompt's progress between its chunks; its KV rows and rings already live in its slot.
++const Fill = struct {
++    start: usize,
++    replay: usize,
++    last_end: usize,
++    head: bool,
++    spans: std.ArrayList(@import("prompt.zig").Span),
++    rows: std.ArrayList(u8),
++
++    fn deinit(f: *Fill, gpa: std.mem.Allocator) void {
++        f.spans.deinit(gpa);
++        f.rows.deinit(gpa);
++    }
++};
++
+ extern "c" fn exp(x: f64) f64;
+ 
+ /// A kept prompt state (the prompt cache's saved state, kept at a chunk end the prompt pass reached before its
+@@ -239,6 +261,8 @@ pub const Lanes = struct {
+     sc: [max_rows]lanes.config.Cost = undefined, // the shared forwards' costs (init)
+     used: [max_streams]bool = @splat(false),
+     seqs: [max_streams]std.ArrayList(i32) = @splat(.empty),
++    fills: [max_streams]?Fill = @splat(null), // 0031
++    filling_slot: ?usize = null, // 0031: the slot every rank's fill state points at
+     built: Built = .{},
+     prof: ?Profile = null,
+     fix_k: ?usize = null, // a measurement (tf-dsv41-lanes --fix-k): K drafts a stream, chances 1 to K and 0 past it
+@@ -273,25 +297,35 @@ pub const Lanes = struct {
+         self.sample_workspace.deinit(self.gpa);
+         if (self.peer != null) self.send(.done) catch {};
+         self.streams.deinit(self.gpa);
++        for (&self.fills) |*f| if (f.*) |*x| x.deinit(self.gpa);
+         for (&self.seqs) |*q| q.deinit(self.gpa);
+         self.wire.deinit(self.gpa);
+     }
+ 
++    /// TF_DS_PREFILL_YIELD=1 (0032): the host advances a prompt a chunk at a time (prefillStep), admitting the queued
++    /// requests and running the live streams' rounds between its chunks. Else the whole prompt in one call, as served.
+     pub fn backend(self: *Lanes) be.Backend {
+-        return .{ .ptr = self, .vtable = &.{
+-            .prefill = prefillFn,
+-            .first = firstFn,
+-            .queue = queueFn,
+-            .read = readFn,
+-            .verify = verifyFn,
+-            .keep = keepFn,
+-            .draft = draftFn,
+-            .probabilities = probabilitiesFn,
+-            .release = releaseFn,
+-            .token_pool = tokenPoolFn,
+-        } };
++        return .{ .ptr = self, .vtable = if (yieldOn()) &vt_stepping else &vt_whole };
+     }
+ 
++    const vt_whole: be.Backend.VTable = .{
++        .prefill = prefillFn,
++        .first = firstFn,
++        .queue = queueFn,
++        .read = readFn,
++        .verify = verifyFn,
++        .keep = keepFn,
++        .draft = draftFn,
++        .probabilities = probabilitiesFn,
++        .release = releaseFn,
++        .token_pool = tokenPoolFn,
++    };
++    const vt_stepping: be.Backend.VTable = blk: {
++        var v = vt_whole;
++        v.prefill_step = prefillStep;
++        break :blk v;
++    };
++
+     /// The facts the round loop reads: windows of the pending row and up to the drafter's block, several streams'
+     /// windows in one forward of at most 16 rows (four streams), the drafter's chances, the served lane's round ms.
+     pub fn facts(self: *const Lanes) lanes.Model {
+@@ -438,23 +472,51 @@ pub const Lanes = struct {
+ 
+     // -- the vtable ---------------------------------------------------------------------------------------------
+ 
+-    /// The lowest free slot, the first extent that fits, the prompt in chunks of the served size (at multiples of it:
+-    /// the chunks the gates checked; the host's chunk plan is not followed), the head's draw of the first token.
++    /// The whole prompt (TF_DS_PREFILL_YIELD unset, and the standalone path): every chunk, with a round of the live
++    /// streams between them when the switch is on (0023). The served host with the switch on calls prefillStep.
+     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
+-        const self = of(ptr);
++        while (!try prefillStep(ptr, s)) {
++            if (s.between) |b| if (yieldOn() and b.ready(b.ptr)) try b.run(b.ptr);
++        }
++    }
++
++    fn fillImages(self: *Lanes, spans: []const @import("prompt.zig").Span, rows: []const u8) !void {
++        const gpa = self.gpa;
++        if (spans.len == 0) return;
++        // the spans and their rows, image_piece bytes of rows a frame (a follower's frame buffer holds 64 KiB and
++        // the ids of a full pool)
++        var off: usize = 0;
++        while (off < rows.len) {
++            const n = @min(image_piece, rows.len - off);
++            if (try self.begin(.fill_images)) {
++                try self.wire.int(gpa, u32, @intCast(spans.len));
++                for (spans) |sp| {
++                    try self.wire.int(gpa, u64, sp.at);
++                    try self.wire.int(gpa, u64, sp.len);
++                }
++                try self.wire.int(gpa, u64, off);
++                try self.wire.buf.appendSlice(gpa, rows[off..][0..n]);
++                try self.flush();
++            }
++            off += n;
++        }
++        try self.m.setImages(spans, rows);
++    }
++
++    /// 0031: the lowest free slot, the first extent that fits, images, a kept state restored: once, before the
++    /// prompt's first chunk. Its progress then lives in fills[slot].
++    fn startFill(self: *Lanes, s: *lanes.Stream) !void {
+         const m = self.m;
+         const gpa = self.gpa;
+-        const t0 = m.now();
+-        defer if (self.prof) |*p| {
+-            p.prefill += m.now() - t0;
+-            p.prefills += 1;
+-        };
++        m.joinAhead();
++        m.fill_seq = &.{};
++        self.filling_slot = null; // a failed setup must not leave another prompt's slot selected
+         const ids = s.prompt();
+         const len = ids.len;
+         if (len == 0) return error.EmptyPrompt;
+         const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
+         if (size > m.pool_cap) return error.PromptTooLong;
+-        if (self.streams.fetchRemove(s)) |old| self.used[old.value.slot] = false;
++        releaseFn(self, s);
+         const slot = std.mem.indexOfScalar(bool, self.used[0..self.m.streams], false) orelse return error.NoFreeSlot;
+         var taken: [max_streams][2]usize = undefined;
+         var nt: usize = 0;
+@@ -496,9 +558,9 @@ pub const Lanes = struct {
+         // images: each span's positions dead in the sequence (negative: no Engram n-gram reaches into or across one),
+         // its rows ready (a gate's) or the tower's (rank 0), all of them sent to rank 1 after the fill's start
+         var spans: std.ArrayList(@import("prompt.zig").Span) = .empty;
+-        defer spans.deinit(gpa);
++        errdefer spans.deinit(gpa);
+         var rows: std.ArrayList(u8) = .empty;
+-        defer rows.deinit(gpa);
++        errdefer rows.deinit(gpa);
+         if (s.images.len > 0) {
+             const image_id = m.cfg.image_token orelse return error.NoVision;
+             const row_bytes = m.cfg.hidden * 2;
+@@ -525,29 +587,12 @@ pub const Lanes = struct {
              try self.wire.int(gpa, u32, @intCast(slot));
              try self.wire.int(gpa, u64, base);
              try self.wire.ids(gpa, seq.items);
@@ -336,33 +712,201 @@ index 8754ddc..42bdb80 100644
          }
 +        m.setSteer(slot, s.steer);
          try m.fillBegin(slot, base);
-         if (spans.items.len > 0) {
-             // the spans and their rows, image_piece bytes of rows a frame (a follower's frame buffer holds 64 KiB and
-@@ -596,6 +605,15 @@ pub const Lanes = struct {
-             start += n;
-             progress.record(self, s, start);
-             if (s.images.len == 0) if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
-+            // Track D (TF_DS_PREFILL_YIELD=1): a round of the other live streams before the next chunk. The prompt's
-+            // chunks and their boundaries are the same (its state between chunks is its extent's rows and its slot's,
-+            // which a round of other slots leaves alone); the Engram read-ahead is joined first and its sequence put
-+            // back after, so the next chunk reads ahead again
-+            if (start < len) if (s.between) |b| if (yieldOn() and b.ready(b.ptr)) {
-+                m.joinAhead();
-+                try b.run(b.ptr);
-+                m.fill_seq = seq.items;
-+            };
+-        if (spans.items.len > 0) {
+-            // the spans and their rows, image_piece bytes of rows a frame (a follower's frame buffer holds 64 KiB and
+-            // the ids of a full pool)
+-            var off: usize = 0;
+-            while (off < rows.items.len) {
+-                const n = @min(image_piece, rows.items.len - off);
+-                if (try self.begin(.fill_images)) {
+-                    try self.wire.int(gpa, u32, @intCast(spans.items.len));
+-                    for (spans.items) |sp| {
+-                        try self.wire.int(gpa, u64, sp.at);
+-                        try self.wire.int(gpa, u64, sp.len);
+-                    }
+-                    try self.wire.int(gpa, u64, off);
+-                    try self.wire.buf.appendSlice(gpa, rows.items[off..][0..n]);
+-                    try self.flush();
+-                }
+-                off += n;
+-            }
+-            try m.setImages(spans.items, rows.items);
+-        }
++        try self.fillImages(spans.items, rows.items);
+         // A fully decoded prefix has valid preceding window keys. For a short
+         // append, preserve that decoder history instead of discarding it at the
+         // new prompt's CED boundary. Encoder-only snapshots retain bounded replay.
+@@ -568,41 +613,93 @@ pub const Lanes = struct {
+             start = sn.at;
+             s.cached = @intCast(sn.at);
          }
-         if (!head) return error.NoPromptLogits;
+-        // where this pass keeps states: the cache's marks and its last chunk end before the replay (the served lane's
+-        // kept prompt), each at the chunk end at or before it
+-        const last_end = std.mem.alignBackward(usize, @min(replay, len - 1), 2);
+-        var head = start == len;
+-        m.fill_seq = seq.items;
+-        defer {
++        self.fills[slot] = .{
++            .start = start,
++            .replay = replay,
++            .last_end = std.mem.alignBackward(usize, @min(replay, len - 1), 2),
++            .head = start == len,
++            .spans = spans,
++            .rows = rows,
++        };
++        self.filling_slot = slot;
++        self.streams.getPtr(s).?.filled = start;
++        if (s.prefill_progress) |hook| hook.at(hook.ptr, s, @intCast(start));
++    }
++
++    /// 0031: every rank's fill state on this partly filled slot again (no full prompt resent, images re-sent).
++    fn selectFill(self: *Lanes, slot: usize, base: usize) !void {
++        const m = self.m;
++        if (self.filling_slot != slot) {
++            self.filling_slot = null;
+             m.joinAhead();
+             m.fill_seq = &.{};
++            if (try self.begin(.fill_resume)) {
++                try self.wire.int(self.gpa, u32, @intCast(slot));
++                try self.wire.int(self.gpa, u64, base);
++                try self.flush();
++            }
++            try m.fillBegin(slot, base);
++            const f = &self.fills[slot].?;
++            try self.fillImages(f.spans.items, f.rows.items);
++            self.filling_slot = slot;
+         }
+-        self.streams.getPtr(s).?.filled = start;
+-        if (s.prefill_progress) |hook| hook.at(hook.ptr, s, @intCast(start));
+-        var progress: Progress = .{};
+-        defer progress.deinit(gpa);
+-        while (start < len) {
+-            if (start > 0 and s.isCancelled()) return error.Cancelled;
++        m.fill_seq = self.seqs[slot].items;
++    }
++
++    /// 0031: one chunk of the prompt (the served chunk sizes and boundaries); true once its first token is drawn.
++    fn prefillStep(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
++        const self = of(ptr);
++        const m = self.m;
++        const gpa = self.gpa;
++        const t0 = m.now();
++        defer if (self.prof) |*p| {
++            p.prefill += m.now() - t0;
++        };
++        errdefer {
++            m.joinAhead();
++            m.fill_seq = &.{};
++        }
++        if (self.streams.contains(s) and self.fills[self.streams.get(s).?.slot] != null) {
++            if (s.isCancelled()) return error.Cancelled;
++        } else try self.startFill(s);
++        const lane = self.streams.get(s).?;
++        try self.selectFill(lane.slot, lane.base);
++        const f = &self.fills[lane.slot].?;
++        const seq = &self.seqs[lane.slot];
++        const len = s.prompt_len;
++        if (f.start < len) {
+             // Keep bulk GEMMs large; split only once at the final encoder checkpoint.
+-            const end = if (start < last_end) @min(len, last_end) else len;
+-            const n = @min(model.chunk_rows, end - start);
++            const end = if (f.start < f.last_end) @min(len, f.last_end) else len;
++            const n = @min(model.chunk_rows, end - f.start);
+             if (try self.begin(.fill_chunk)) {
+-                try self.wire.int(gpa, u64, start);
++                try self.wire.int(gpa, u64, f.start);
+                 try self.wire.int(gpa, u32, @intCast(n));
+-                try self.wire.int(gpa, u64, replay);
++                try self.wire.int(gpa, u64, f.replay);
+                 try self.flush();
+             }
+-            head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay);
+-            start += n;
+-            progress.record(self, s, start);
+-            if (s.images.len == 0) if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
++            f.head = try m.fillChunk(seq.items[0 .. f.start + n], f.start, n, f.replay);
++            f.start += n;
++            self.streams.getPtr(s).?.filled = f.start;
++            if (s.prefill_progress) |hook| hook.at(hook.ptr, s, @intCast(f.start));
++            if (s.images.len == 0) if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
++            if (f.start < len) {
++                // a round of other slots may run before the next chunk: the Engram read-ahead is joined first; the
++                // next step's selectFill puts the sequence back. Without TF_DS_PREFILL_YIELD the read-ahead runs on
++                if (yieldOn()) if (s.between) |b| if (b.ready(b.ptr)) {
++                    m.joinAhead();
++                    m.fill_seq = &.{};
++                };
++                return false;
++            }
+         }
+-        if (!head) return error.NoPromptLogits;
++        m.joinAhead();
++        m.fill_seq = &.{};
++        if (!f.head) return error.NoPromptLogits;
          // Full identical prompts reuse the complete state and logits. A later longer
-@@ -991,6 +1009,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+         // prompt can use its encoder state only when bounded replay starts after it.
+         if (s.images.len == 0) if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(len));
+         const logits = try m.promptLogitsHost();
+-        progress.poll(self, s);
++        if (s.prefill_progress) |hook| hook.at(hook.ptr, s, @intCast(len));
+         self.streams.getPtr(s).?.filled = len;
+         if (logits_sha) {
+             var dg: [32]u8 = undefined;
+@@ -627,6 +724,10 @@ pub const Lanes = struct {
+         }
+         const token = try self.drawToken(logits, len, s.sampling);
+         self.streams.getPtr(s).?.first = self.take(token);
++        f.deinit(gpa);
++        self.fills[lane.slot] = null;
++        if (self.prof) |*p| p.prefills += 1;
++        return true;
+     }
+ 
+     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
+@@ -919,7 +1020,17 @@ pub const Lanes = struct {
+             if (at > s.prompt_len and at <= s.context.items.len) if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(at));
+         }
+         const kv = self.streams.fetchRemove(s).?;
+-        self.used[kv.value.slot] = false;
++        const slot = kv.value.slot;
++        if (self.fills[slot]) |*f| { // 0031: a prompt released between its chunks
++            if (self.filling_slot == slot) {
++                self.m.joinAhead();
++                self.m.fill_seq = &.{};
++            }
++            f.deinit(self.gpa);
++            self.fills[slot] = null;
++        }
++        if (self.filling_slot == slot) self.filling_slot = null;
++        self.used[slot] = false;
+     }
+ };
+ 
+@@ -975,6 +1086,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+             7 => .snap_drop,
+             8 => .fill_images,
+             9 => .done,
++            10 => .fill_resume,
+             else => return error.BadFrame,
+         };
+         if (try r.int(u64) != step) return error.OutOfStep;
+@@ -991,6 +1103,15 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                  if (slot >= max_streams) return error.BadSlot;
                  img_rows.clearRetainingCapacity();
                  try r.ids(gpa, &seqs[slot]);
 +                m.setSteer(slot, try r.int(u8));
++                m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
++                m.fill_seq = seqs[slot].items;
++            },
++            .fill_resume => { // 0031: back to a partly filled slot (its ids and steer are already here)
++                slot = try r.int(u32);
++                const base = try r.int(u64);
++                if (slot >= max_streams) return error.BadSlot;
++                img_rows.clearRetainingCapacity();
                  m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
                  m.fill_seq = seqs[slot].items;
              },
-@@ -999,6 +1018,9 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+@@ -999,6 +1120,9 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                  const n: usize = try r.int(u32);
                  const replay: usize = @intCast(try r.int(u64));
                  if (start + n > seqs[slot].items.len) return error.BadChunk;
@@ -490,6 +1034,23 @@ index bec4277..23dd70c 100644
      // the prefetch behind wo_b: the ffn mix's weights, the router, the shared expert's gate
      try rd.prefetch(e, &.{ .{ lay.hc_ffn[0], hcFnBytes(c) }, .{ lay.gate_w, @as(u64, c.experts) * c.hidden * 2 }, lay.experts.shared_gate, lay.experts.shared_up, lay.experts.shared_down }, prefetch_budget / 2);
  }
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 7b05296..bb0c5d5 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -215,6 +215,12 @@ const Host = struct {
+                     return x.inner.vtable.prefill(x.inner.ptr, s);
+                 }
+             }.f,
++            .prefill_step = if (v.prefill_step != null) struct {
++                fn f(p: *anyopaque, s: *lanes.Stream) anyerror!bool {
++                    const x = bind(p);
++                    return x.inner.vtable.prefill_step.?(x.inner.ptr, s);
++                }
++            }.f else null,
+             .first = struct {
+                 fn f(p: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
+                     const x = bind(p);
 diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
 index 655df22..309842e 100644
 --- a/zig/src/server/chat.zig
