@@ -136,7 +136,7 @@ and its output figure is higher for that reason too. Other checks:
   76.7, 151.1 and 252.7 s. They end one after another.
 - `stall` with a 40k-token prompt at `DECODE_SHARE=50`: the three writing streams kept 53 % of their speed, the prompt
   answered in 45.9 s, the longest pause was 1.2 s.
-- `POOL=6000000`: the model takes 96.3 GiB a Spark and the head kept 11.7 GiB or more available through these runs.
+- `POOL=6000000`: the model takes 96.3 GiB a Spark and the head kept 11.3 GiB or more available through these runs.
   `POOL=8000000`: 100.1 GiB, and the head fell to 5.6 GiB available.
 
 Not measured: `rotate` after this change, a full-pool stress run above the 4M pool, and other values of `DECODE_SHARE`.
