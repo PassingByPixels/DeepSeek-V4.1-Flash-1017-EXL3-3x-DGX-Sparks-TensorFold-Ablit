@@ -1,0 +1,27 @@
+DeepSeek-V4.1-Flash-1017 EXL3 3.5 bpw on 3x DGX Spark with TensorFold, with per-request abliteration (this fork)
+
+This fork's own code, scripts and documentation are licensed under the Apache License, Version 2.0 (see LICENSE).
+The recipe it is built on, and the work that recipe builds on, are credited in README.md ("Credits").
+
+ablit/ablit-runtime.patch carries work ported from other projects. Each part keeps its authors' license:
+
+Prefill yield, prefill admission, DSML tool-call streaming
+  https://github.com/MiaAI-Lab (the DeepSeek-V4.1-Flash-1017 recipes for two and for four DGX Sparks, zig/patches)
+  Copyright 2026 MiaAI-Lab and its contributors. Apache License, Version 2.0.
+  Ported: 0023 (prefill yield), 0031 by Mauvis Ledford and 0032 (prefill admission), 0027 by Coinupbtc (tool-call
+  prose), 0048 by nuk3s (DSML tool calls stream as they decode), 0064, 0065 and 0067 by Hector Isaza (DSML fixes, the
+  live / hold switch, the orphan-closer warning).
+  What this fork changed: the patches are applied by hand to LakyFx's TP3 runtime, whose source differs from the
+  engine they were written for; the keep-alive ping of 0065 is left out; the abliteration's per-request switch is
+  kept through them.
+
+The DSML parse (zig/src/server/tool_parse.zig and its tests, inside the patch)
+  https://github.com/bertholomus/TensorFold (branch deepseek-v41-zig, commit
+  fbbc97132cd004237d9887b8d3185896efaedc5c)
+  Written by BertholomusAI and the TensorFold contributors, on TensorFold (https://github.com/ashhart/TensorFold,
+  Copyright 2026 TensorFold contributors). Apache License, Version 2.0.
+  Taken as that commit has it, because the tool-call streaming above is written for it.
+
+Written for this fork, in the same patch: the per-request abliteration, the prompt order and time share of the
+host (core/lane_host.zig), and the streaming of object and array tool arguments (a third value, strings, of
+TENSORFOLD_TOOL_STREAM turns it off).

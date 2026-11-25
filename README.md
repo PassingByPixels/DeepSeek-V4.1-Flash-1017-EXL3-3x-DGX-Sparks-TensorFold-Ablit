@@ -141,6 +141,45 @@ and its output figure is higher for that reason too. Other checks:
 
 Not measured: `rotate` after this change, a full-pool stress run above the 4M pool, and other values of `DECODE_SHARE`.
 
+### DeepSeek's tool calls stream while they are written (`TOOL_STREAM`)
+
+The served runtime sends a DeepSeek (DSML) tool call whole when the reply ends, so a client shows nothing while the
+model writes a long argument. With the patched runtime (`ABLIT=1`) the fork carries the tool-call streaming of Mia's AI
+Lab's two-Spark recipe, ported: their patches `0027` (Coinupbtc), `0048` (nuk3s), `0064`, `0065` and `0067` (Hector
+Isaza), with the DSML parse of the engine those patches are written for. On top of them, an object or array argument
+(a DSML parameter with `string="false"` that starts with `{` or `[`) also goes out while it is written, as compact
+JSON; in the two-Spark recipe such a value goes out whole when its parameter closes.
+
+Measured here through the API, one streamed call of about 1,200 characters of arguments (`tools/tool_probe.py`):
+
+| arguments | before: pieces, first piece after | now: pieces, largest, first piece after, longest gap |
+|---|---|---|
+| `flat`: two string values | 1, 3.8 s | 114, 27 characters, 0.8 s, 0.06 s |
+| `nested`: the text inside an object value | 1, 3.8 s | 122, 26 characters, 0.6 s, 0.07 s |
+| `ops`: the text inside a list of objects | 1, 3.9 s | 121, 22 characters, 0.7 s, 0.08 s |
+
+The joined pieces are the call's JSON arguments in each case. Also checked on the three Sparks: a whole (not streamed)
+reply with a nested argument, a tool result sent back, two calls in one streamed reply, and the checks of the sections
+above (refusals 0/24 and 18/24, the cache test, an image, a short request during a long prompt: unchanged).
+
+`TOOL_STREAM` in `scripts/local.sh` (`TENSORFOLD_TOOL_STREAM` to rank 0), applied at a restart:
+
+- `live` (default): calls go out as they decode, object and array values included.
+- `strings`: string values as they decode; every other value whole when its parameter closes.
+- `hold`: each call whole when the reply ends.
+
+What differs from before, and from the two-Spark recipe:
+
+- A call to a tool the request did not offer comes back as a call under the model's name (as in the two-Spark
+  recipe). Before, its markup stayed in the reply's text.
+- `live`: when an object or array value is not strict JSON (a trailing comma, `NaN`), its pieces stop, the call is
+  not closed and the stream ends with `stop`. With `strings`, and in a reply that is not streamed, such a value is a
+  string, as before.
+- The two-Spark recipe's keep-alive ping is not ported. In `hold`, a stream sends nothing while a call is written.
+
+The runtime's own unit tests for this run on the head with `zig/tests/server/zig_test.sh` in the patched source
+(149 server tests; `zig build test` on Linux does not include them).
+
 ### Measured (our three Sparks, 4K-page kernels, `ALLOW_4K_PAGES=1`, GPU clocks capped at 2,000 MHz)
 
 | | stock | abliterated, run-time L18-25 |
@@ -299,7 +338,7 @@ match its pinned source exactly once:
 `scripts/config.sh` holds the pins and defaults. Override them in `scripts/local.sh`: `WORKER1`, `WORKER2`,
 `DATA_DIR`, `HOST`, `PORT`, `API_KEY_FILE`, `SERVED_NAME`, `POOL`, `CONTEXT`, `PARALLEL`, `PROMPT_CACHE_GIB`,
 `REASONING`, `FABRIC_PEER1` / `FABRIC_PEER2` (copy the setup's files over these cable addresses), `APPLY_ROUTES`,
-`MIN_AVAIL_GIB`, `CUDA_LIB`, `ALLOW_4K_PAGES`, `PREFILL_YIELD`, `FILL_ORDER` and `DECODE_SHARE`. Serving settings take effect at `./start.sh restart`; a larger
+`MIN_AVAIL_GIB`, `CUDA_LIB`, `ALLOW_4K_PAGES`, `PREFILL_YIELD`, `FILL_ORDER`, `DECODE_SHARE` and `TOOL_STREAM`. Serving settings take effect at `./start.sh restart`; a larger
 `POOL` re-cuts the RoPE tables first.
 
 **Context:** `CONTEXT` is each request's window and `POOL` the KV all requests share. A request's window may exceed
@@ -312,6 +351,9 @@ match its pinned source exactly once:
 - **[drowzeys](https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated):** the Keys abliteration
   of DeepSeek-V4.1-Flash-1017 (MIT, gated with a Responsible Use agreement) whose direction the run-time edit applies.
   Used with drowzeys' agreement; the recipe fetches it with your own accepted token.
+- **[Mia's AI Lab](https://github.com/MiaAI-Lab) and the contributors to its DeepSeek recipes:** the
+  prefill yield and admission (`0023`, `0031` by Mauvis Ledford, `0032`) and the DSML tool-call streaming (`0027` by
+  Coinupbtc, `0048` by nuk3s, `0064`, `0065` and `0067` by Hector Isaza) that this fork ports to the TP3 runtime.
 
 - **[DeepSeek](https://huggingface.co/deepseek-ai):** DeepSeek-V4.1-Flash-1017 (MIT).
 - **[LakyFx](https://github.com/LakyFx):** the TensorFold TP3 runtime for three DGX Sparks (MIT): its launcher,

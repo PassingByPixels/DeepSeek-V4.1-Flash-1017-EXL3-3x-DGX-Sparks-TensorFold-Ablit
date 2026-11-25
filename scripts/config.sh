@@ -62,6 +62,10 @@ FILL_ORDER=${FILL_ORDER:-shortest}
 # read. 0: one decode round after each 2,048-token chunk of the prompt. Higher: the writing streams slow down less and
 # a new long prompt takes longer (README, "Which prompt reads next").
 DECODE_SHARE=${DECODE_SHARE:-25}
+# With ABLIT=1 (the patched runtime): how a stream sends DeepSeek's DSML tool calls (TENSORFOLD_TOOL_STREAM, ported from
+# Mia's AI Lab 0048 and 0065). live: as they decode, object and array values included. strings: string values as they
+# decode, every other value whole when its parameter closes. hold: each call whole when the reply ends.
+TOOL_STREAM=${TOOL_STREAM:-live}
 
 # NCCL on a switchless triangle: the switchless build's ring mode (README, Requirements). RANK_ENV: anything else to
 # export to every rank (e.g. NCCL_DEBUG=INFO).
