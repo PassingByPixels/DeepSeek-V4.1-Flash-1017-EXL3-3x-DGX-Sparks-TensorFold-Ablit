@@ -102,6 +102,45 @@ Same reply either way. With it, the host also reads prompts one chunk per turn, 
 
 `PREFILL_YIELD=0` in `scripts/local.sh` turns both off.
 
+### Which prompt reads next, and what the writing streams get (`FILL_ORDER`, `DECODE_SHARE`)
+
+Agent work showed two faults in the above (several long chats at once, 2026-11-06 and 2026-11-24). With rotation,
+four long prompts each read at a quarter of the speed and none answered early. And one decode round after each
+2,048-token chunk left the streams that already wrote at about 4 % of their speed while a prompt was read. The patched
+runtime (`ABLIT=1`, `PREFILL_YIELD=1`) now has two settings:
+
+- `FILL_ORDER=shortest` (default): a new prompt gets its first chunk at once (a short or cached request ends there);
+  then the prompt with the fewest tokens left reads, and every second chunk goes to the prompt that began first, so a
+  run of short prompts cannot hold a long one back. `rotate` is the turn-taking of `0031`.
+- `DECODE_SHARE` (percent, default 25, 0 to 90): the part of the engine's time the writing streams get while a prompt
+  is read. `0` is one decode round after each chunk. The setting does not add work the engine can do; it moves the wait
+  between the streams that write and the prompt that is read.
+
+Measured here with `tools/load_test.py` (thinking off, greedy, 8 slots, each prompt new for its run and with a pass
+code the reply must find; every pass code was found, no request failed):
+
+| `agents`: chats with 60k to 140k tokens already read take turns for 6 minutes (each turn adds ~1,500 tokens and asks for ~250 words); a cold 100k-token chat arrives every 90 s | `DECODE_SHARE=0` | `25` | `50` |
+|---|---|---|---|
+| 4 agents: output tokens a minute | 3,421 | 3,911 | 3,783 |
+| 4 agents: turn time, 95th percentile | 73.6 s | 25.4 s | 40.0 s |
+| 4 agents: the cold chats' first token | 75 s, 71 s | 139 s, 86 s | 275 s |
+| 7 agents: output tokens a minute | 3,910 | 5,207 | 3,961 |
+| 7 agents: turn time, 95th percentile | 89.0 s | 35.9 s | 67.0 s |
+| 7 agents: the cold chats' first token | 78 s, 74 s | 198 s | 281 s |
+
+The `0` column was measured before the began-first rule and with `POOL=8000000`; the others with it and
+`POOL=6000000`. Where a column shows one cold chat, only one ended inside the 6 minutes, so that run did less reading
+and its output figure is higher for that reason too. Other checks:
+
+- `cold` (four new prompts of 41k, 84k, 126k and 169k tokens at the same moment, `shortest`): first tokens after 28.7,
+  76.7, 151.1 and 252.7 s. They end one after another.
+- `stall` with a 40k-token prompt at `DECODE_SHARE=50`: the three writing streams kept 53 % of their speed, the prompt
+  answered in 45.9 s, the longest pause was 1.2 s.
+- `POOL=6000000`: the model takes 96.3 GiB a Spark and the head kept 11.7 GiB or more available through these runs.
+  `POOL=8000000`: 100.1 GiB, and the head fell to 5.6 GiB available.
+
+Not measured: `rotate` after this change, a full-pool stress run above the 4M pool, and other values of `DECODE_SHARE`.
+
 ### Measured (our three Sparks, 4K-page kernels, `ALLOW_4K_PAGES=1`, GPU clocks capped at 2,000 MHz)
 
 | | stock | abliterated, run-time L18-25 |
@@ -260,7 +299,7 @@ match its pinned source exactly once:
 `scripts/config.sh` holds the pins and defaults. Override them in `scripts/local.sh`: `WORKER1`, `WORKER2`,
 `DATA_DIR`, `HOST`, `PORT`, `API_KEY_FILE`, `SERVED_NAME`, `POOL`, `CONTEXT`, `PARALLEL`, `PROMPT_CACHE_GIB`,
 `REASONING`, `FABRIC_PEER1` / `FABRIC_PEER2` (copy the setup's files over these cable addresses), `APPLY_ROUTES`,
-`MIN_AVAIL_GIB`, `CUDA_LIB` and `ALLOW_4K_PAGES`. Serving settings take effect at `./start.sh restart`; a larger
+`MIN_AVAIL_GIB`, `CUDA_LIB`, `ALLOW_4K_PAGES`, `PREFILL_YIELD`, `FILL_ORDER` and `DECODE_SHARE`. Serving settings take effect at `./start.sh restart`; a larger
 `POOL` re-cuts the RoPE tables first.
 
 **Context:** `CONTEXT` is each request's window and `POOL` the KV all requests share. A request's window may exceed

@@ -54,6 +54,14 @@ ABLIT_SIDECAR=wo_b_l10_35_1017.safetensors
 # With ABLIT=1 (the patched runtime): a decode round of the other streams between a long prompt's chunks, so a prompt
 # being read does not stop everyone else (TF_DS_PREFILL_YIELD, ported from Mia's AI Lab 0023). 0: whole prompt first.
 PREFILL_YIELD=${PREFILL_YIELD:-1}
+# With PREFILL_YIELD=1. FILL_ORDER: which prompt reads next when several are being read. shortest: a new prompt gets
+# its first chunk at once, then the prompt with the fewest tokens left reads, and every second chunk goes to the prompt
+# that began first; rotate: one chunk each in turn (N prompts each read at 1/N speed).
+FILL_ORDER=${FILL_ORDER:-shortest}
+# DECODE_SHARE (percent, 0 to 90): the part of the engine time that the streams already writing get while a prompt is
+# read. 0: one decode round after each 2,048-token chunk of the prompt. Higher: the writing streams slow down less and
+# a new long prompt takes longer (README, "Which prompt reads next").
+DECODE_SHARE=${DECODE_SHARE:-25}
 
 # NCCL on a switchless triangle: the switchless build's ring mode (README, Requirements). RANK_ENV: anything else to
 # export to every rank (e.g. NCCL_DEBUG=INFO).

@@ -1,19 +1,3 @@
-ablit-runtime.patch: run-time abliteration for LakyFx TensorFold TP3 (runtime snapshot 61357deb, extracted by its
-extract.py into $DATA_DIR/build/source). Apache-2.0, like the TensorFold sources it changes. Changes, in short:
-  - zig/src/families/dsv41/abl.zig (new): TF_ABLIT loads a rank-1 direction per layer; after attn.wo_b each rank
-    applies y -= lambda * mask[row] * (r . y) r to its fp32 partial (linear, so the all-gathered sum gets the same edit).
-  - cublas.zig: Sdgmm and a k=1 Sgemm. model.zig / prompt.zig / round.zig: the edit and the per-row mask.
-  - lanes.zig: each slot carries its stream steer (one byte in the fill_begin frame to the followers).
-  - core lanes/engine_api/lane_host, server chat/openai/serve: steer from the model id (-ablit / -stock) or a boolean
-    "ablit" field; TF_ABLIT_DEFAULT for the plain id; an edited request gets its own prompt-cache namespace.
-  - core lane_host/lanes stream, dsv41 lanes.zig: TF_DS_PREFILL_YIELD=1 runs a decode round of the live streams
-    between a prompt's chunks, so a long prompt no longer stops everyone else's decode. Ported from Mia's AI Lab
-    patch 0023 (Track D) of MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold (Apache-2.0).
-  - core lane_host/lanes engine+backend, native cuda, dsv41 lanes.zig: with TF_DS_PREFILL_YIELD=1 a prompt is read one
-    chunk per host turn (prefillStep), rotating between admitted prompts, so a request that arrives during a long
-    prompt starts at once. Ported from Mia's AI Lab patches 0031 (Mauvis Ledford) and 0032, same repository.
-git apply skips these lines.
-
 diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
 index 6901d9f..67f7ab7 100644
 --- a/zig/src/core/engine_api.zig
@@ -28,21 +12,64 @@ index 6901d9f..67f7ab7 100644
      images: []const Image = &.{},
      max_tokens: u32,
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
-index b65b456..1643247 100644
+index b65b456..3b49985 100644
 --- a/zig/src/core/lane_host.zig
 +++ b/zig/src/core/lane_host.zig
-@@ -47,6 +47,10 @@ pub const LaneHost = struct {
+@@ -47,7 +47,23 @@ pub const LaneHost = struct {
      // the request at the queue's front waits for room in the backend's pool (its prompt pass refused ContextFull while
      // other streams ran): admitted again once fewer than this many streams are active
      full_wait: ?usize = null,
 +    // Track D (0023): a round run between an admitting job's prompt chunks failed (its error): once the prompt's pass
 +    // has unwound, every admitted job fails with it, as after any failed round
 +    between_failed: ?[]const u8 = null,
-+    fill_next: usize = 0, // 0031: next admitted prompt to advance by one chunk
++    fill_next: usize = 0, // 0031: next admitted prompt to advance by one chunk (TF_DS_FILL_ORDER=rotate)
++    // TF_DS_FILL_ORDER: which started prompt gets the next chunk. shortest (default): the one with the fewest tokens
++    // left, so prompts end one after another. rotate: 0031's turns, where N long prompts each read at 1/N speed and
++    // all end late.
++    fill_order: FillOrder = .shortest,
++    // TF_DS_DECODE_SHARE (percent, 0 to 90): while a prompt fills and streams are live, the part of the engine's time
++    // the streams' rounds get. 0: one round after each prompt chunk (0031).
++    decode_share: u8 = 0,
++    decode_owed: i96 = 0, // nanoseconds of rounds due before the next prompt chunk
++    // shortest order: every second chunk goes to the prompt that began first, so a run of short prompts cannot hold a
++    // long one back without end
++    fill_oldest: bool = false,
  
++    const FillOrder = enum { shortest, rotate };
      const Mark = struct { at: i96, tokens: u64 };
      const window_ns: i96 = 2 * std.time.ns_per_s;
-@@ -266,6 +270,7 @@ pub const LaneHost = struct {
+ 
+@@ -66,6 +82,7 @@ pub const LaneHost = struct {
+         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
+         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
+         kept0: u64 = 0, // the store's kept count when the job looked it up
++        filled: u32 = 0, // prompt tokens its chunks have reached (the shortest-first order reads it)
+ 
+         /// A completed CUDA event confirms a chunk, without making the engine wait for it.
+         fn progress(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
+@@ -75,6 +92,7 @@ pub const LaneHost = struct {
+             h.noteLive();
+             h.lock();
+             defer h.unlock();
++            job.filled = @max(job.filled, at);
+             h.prefill_telemetry.progress = at;
+             h.prefill_telemetry.pending = job.request.prompt.len -| at;
+             if (now > job.began and at > s.cached) {
+@@ -106,7 +124,12 @@ pub const LaneHost = struct {
+         var enforced = info_;
+         enforced.loop_guard = true;
+         enforced.cache_salt = true;
+-        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced };
++        var h: LaneHost = .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced };
++        if (std.c.getenv("TF_DS_FILL_ORDER")) |v| {
++            if (std.mem.eql(u8, std.mem.span(v), "rotate")) h.fill_order = .rotate;
++        }
++        if (std.c.getenv("TF_DS_DECODE_SHARE")) |v| h.decode_share = @min(90, std.fmt.parseInt(u8, std.mem.span(v), 10) catch 0);
++        return h;
+     }
+ 
+     pub fn start(h: *LaneHost) !void {
+@@ -266,6 +289,7 @@ pub const LaneHost = struct {
  
      /// Sends a stream's new tokens; true once it has finished (its job freed).
      fn deliver(h: *LaneHost, job: *Job) bool {
@@ -50,7 +77,7 @@ index b65b456..1643247 100644
          h.send(job);
          if (!job.stream.finished) return false;
          const reason: Reason = switch (job.stream.reason) {
-@@ -306,10 +311,74 @@ pub const LaneHost = struct {
+@@ -306,10 +330,74 @@ pub const LaneHost = struct {
      }
  
      /// Cancels queued and admitted jobs named since the last round.
@@ -125,7 +152,7 @@ index b65b456..1643247 100644
          var dropped: std.ArrayList(*Job) = .empty;
          for (ids) |id| {
              for (h.queued.items, 0..) |job, i| if (job.id == id) {
-@@ -322,7 +391,7 @@ pub const LaneHost = struct {
+@@ -322,7 +410,7 @@ pub const LaneHost = struct {
          dropped.deinit(h.gpa);
          for (ids) |id| {
              for (h.admitted.items, 0..) |job, i| if (job.id == id) {
@@ -134,7 +161,7 @@ index b65b456..1643247 100644
                  h.lock();
                  _ = h.admitted.orderedRemove(i);
                  h.unlock();
-@@ -330,7 +399,6 @@ pub const LaneHost = struct {
+@@ -330,7 +418,6 @@ pub const LaneHost = struct {
                  break;
              };
          }
@@ -142,7 +169,7 @@ index b65b456..1643247 100644
      }
  
      fn lock(h: *LaneHost) void {
-@@ -349,7 +417,7 @@ pub const LaneHost = struct {
+@@ -349,7 +436,7 @@ pub const LaneHost = struct {
              return false;
          }
          if (h.full_wait) |n| {
@@ -151,7 +178,7 @@ index b65b456..1643247 100644
              if (active > 0 and active >= n) {
                  h.unlock();
                  return false;
-@@ -363,6 +431,43 @@ pub const LaneHost = struct {
+@@ -363,6 +450,43 @@ pub const LaneHost = struct {
              return true;
          };
          h.unlock();
@@ -195,7 +222,7 @@ index b65b456..1643247 100644
          const r = job.request;
          var reuse: lanes.stream.Reuse = .{};
          // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
-@@ -372,7 +477,10 @@ pub const LaneHost = struct {
+@@ -372,7 +496,10 @@ pub const LaneHost = struct {
              job.marks = l.marks;
              reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
          } else |_| {};
@@ -207,7 +234,7 @@ index b65b456..1643247 100644
          job.stream = lanes.Stream.init(h.gpa, .{
              .id = "request",
              .prompt = r.prompt,
-@@ -391,35 +499,62 @@ pub const LaneHost = struct {
+@@ -391,37 +518,99 @@ pub const LaneHost = struct {
              .reuse = reuse,
              .prefill_progress = .{ .ptr = job, .at = Job.progress },
              .images = r.images,
@@ -222,65 +249,96 @@ index b65b456..1643247 100644
          job.started = true;
 -        const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
 -        job.began = began;
--        h.lock();
--        h.prefill_telemetry.active = 1;
--        h.prefill_rate = 0;
--        h.prefill_telemetry.progress = 0;
--        h.prefill_telemetry.pending = r.prompt.len;
--        h.unlock();
--        defer {
 +        job.began = std.Io.Clock.awake.now(h.io).toNanoseconds();
 +        return true;
 +    }
 +
-+    /// 0031: one chunk per host turn, rotating between the admitted prompts, so a request that arrives can start
-+    /// before a long prompt ends, and the live streams' round runs between turns.
-+    fn fillOne(h: *LaneHost) void {
-+        if (!h.core.fills()) return;
-+        const n = h.admitted.items.len;
-+        for (0..n) |offset| {
-+            const i = (h.fill_next + offset) % n;
-+            const job = h.admitted.items[i];
++    /// The admitted prompt that gets the next chunk; null when none is filling. `rotate`: the next one from `from`
++    /// (0031). `shortest`: a prompt not started yet goes first, in arrival order (its first step finds its kept state,
++    /// and a short or cached request ends there, so a new request still starts at once); then the started prompt with
++    /// the fewest tokens left, the earlier one on a tie. With `oldest`, the started prompt that began first instead.
++    fn pickFill(jobs: []const *Job, order: FillOrder, from: usize, oldest: bool) ?usize {
++        var best: ?usize = null;
++        var best_left: i96 = 0;
++        for (0..jobs.len) |offset| {
++            const i = if (order == .rotate) (from + offset) % jobs.len else offset;
++            const job = jobs[i];
 +            if (job.prefilled != null) continue;
-+            h.fill_next = i + 1;
-+            const first = !job.started;
-+            if (first and !h.setup(job)) return;
-             h.lock();
--            h.prefill_telemetry.active = 0;
--            h.prefill_telemetry.pending = 0;
-+            h.prefill_telemetry.active = 1;
-+            h.prefill_telemetry.pending = job.request.prompt.len -| h.prefill_telemetry.progress;
-             h.unlock();
-+            const done = h.core.fillStream(&job.stream, first) catch |e| {
-+                if (e == error.Cancelled) {
-+                    _ = h.cancel(job);
-+                } else if (e == error.ContextFull and h.admitted.items.len > 1) {
-+                    _ = h.requeue(job);
-+                } else {
-+                    _ = h.drop(job, h.words(e));
-+                }
-+                h.lock();
-+                h.prefill_telemetry.active = 0;
-+                h.unlock();
-+                return;
-+            };
-+            job.reported(); // the first step restored it: no dangling cache entry across another prompt's keep
-+            if (done) {
-+                h.prefilled(job, job.began);
-+                if (h.deliver(job)) h.remove(job);
++            if (order == .rotate or !job.started) return i;
++            const left: i96 = if (oldest) job.began else @intCast(job.request.prompt.len -| @max(job.filled, job.stream.cached));
++            if (best == null or left < best_left) {
++                best = i;
++                best_left = left;
 +            }
-             h.noteLive();
-+            return;
-         }
++        }
++        return best;
++    }
++
++    /// 0031: one chunk per host turn for the prompt pickFill names, so a request that arrives can start before a long
++    /// prompt ends, and the live streams' round runs between turns. True when a chunk ran.
++    fn fillOne(h: *LaneHost) bool {
++        if (!h.core.fills()) return false;
++        const i = pickFill(h.admitted.items, h.fill_order, h.fill_next, h.fill_oldest) orelse return false;
++        const job = h.admitted.items[i];
++        h.fill_next = i + 1;
++        const first = !job.started;
++        if (!first) h.fill_oldest = !h.fill_oldest;
++        if (first and !h.setup(job)) return false;
+         h.lock();
+         h.prefill_telemetry.active = 1;
+-        h.prefill_rate = 0;
+-        h.prefill_telemetry.progress = 0;
+-        h.prefill_telemetry.pending = r.prompt.len;
++        h.prefill_telemetry.pending = job.request.prompt.len -| h.prefill_telemetry.progress;
+         h.unlock();
+-        defer {
++        const done = h.core.fillStream(&job.stream, first) catch |e| {
++            if (e == error.Cancelled) {
++                _ = h.cancel(job);
++            } else if (e == error.ContextFull and h.admitted.items.len > 1) {
++                _ = h.requeue(job);
++            } else {
++                _ = h.drop(job, h.words(e));
++            }
+             h.lock();
+             h.prefill_telemetry.active = 0;
+-            h.prefill_telemetry.pending = 0;
+             h.unlock();
+-            h.noteLive();
+-        }
 -        if (h.loneFits(job)) return h.runLone(job, began);
 -        h.core.addStream(&job.stream) catch |e| {
 -            if (e == error.Cancelled) return h.cancel(job);
 -            if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
 -            return h.drop(job, h.words(e));
--        };
++            return true;
+         };
 -        h.prefilled(job, began);
 -        if (h.deliver(job)) h.remove(job);
--        return true;
++        job.reported(); // the first step restored it: no dangling cache entry across another prompt's keep
++        if (done) {
++            h.prefilled(job, job.began);
++            if (h.deliver(job)) h.remove(job);
++        }
++        h.noteLive();
+         return true;
+     }
+ 
++    /// Whether this turn runs a prompt chunk: not while the live streams are owed rounds (TF_DS_DECODE_SHARE), except
++    /// for a prompt not started yet.
++    fn fillDue(h: *const LaneHost) bool {
++        if (h.decode_owed <= 0 or h.core.activeCount() == 0) return true;
++        for (h.admitted.items) |job| if (!job.started and job.prefilled == null) return true;
++        return false;
++    }
++
++    /// The rounds due after a turn. A turn with a prompt chunk adds the streams' share of its time: `share` percent
++    /// of the engine's time means share / (100 - share) of the chunk's. The chunk's GPU work can end inside the round
++    /// after it, so the two are timed as one. A turn with a round alone pays its own time back.
++    fn owedAfter(owed: i96, share: u8, chunk_turn: bool, turn_ns: i96) i96 {
++        if (share == 0) return 0;
++        if (chunk_turn) return @max(0, owed) + @divTrunc(turn_ns * share, 100 - @as(i96, share));
++        return @max(0, owed - turn_ns);
 +    }
 +
 +    /// 0031: an admitted prompt still filling.
@@ -288,27 +346,39 @@ index b65b456..1643247 100644
 +        if (!h.core.fills()) return false;
 +        for (h.admitted.items) |job| if (job.prefilled == null) return true;
 +        return false;
-     }
- 
++    }
++
      fn prefilled(h: *LaneHost, job: *Job, began: i96) void {
-@@ -568,6 +703,7 @@ pub const LaneHost = struct {
+         const done = std.Io.Clock.awake.now(h.io).toNanoseconds();
+         h.lock();
+@@ -568,6 +757,8 @@ pub const LaneHost = struct {
              h.takeCancels();
              h.takeCacheReset();
              while (h.admitOne()) {}
-+            h.fillOne();
++            const turn_at = std.Io.Clock.awake.now(h.io).toNanoseconds();
++            const chunk_turn = h.fillDue() and h.fillOne();
              h.noteLive();
              h.lock();
              if (h.closing) {
-@@ -578,7 +714,7 @@ pub const LaneHost = struct {
+@@ -578,7 +769,8 @@ pub const LaneHost = struct {
                  continue;
              }
              if (h.core.activeCount() == 0) {
 -                if (h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes))
++                h.decode_owed = 0;
 +                if (!h.filling() and h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes))
                      h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
                  h.unlock();
                  continue;
-@@ -607,7 +743,7 @@ pub const LaneHost = struct {
+@@ -588,6 +780,7 @@ pub const LaneHost = struct {
+                 h.failAll(@errorName(e));
+                 continue;
+             };
++            h.decode_owed = owedAfter(h.decode_owed, h.decode_share, chunk_turn, std.Io.Clock.awake.now(h.io).toNanoseconds() - turn_at);
+             var i: usize = 0;
+             while (i < h.admitted.items.len) {
+                 const job = h.admitted.items[i];
+@@ -607,7 +800,7 @@ pub const LaneHost = struct {
          h.admitted.clearRetainingCapacity();
          h.unlock();
          for (jobs) |job| {
@@ -317,6 +387,100 @@ index b65b456..1643247 100644
              h.finish(job, .failed, message);
          }
          h.gpa.free(jobs);
+@@ -825,3 +1018,93 @@ test "prefill counters are available before generated reply completion" {
+     try std.testing.expect(p.seconds >= 1);
+     try std.testing.expect(!job.stream.finished);
+ }
++
++test "the next prompt chunk goes to a new prompt first, then to the started prompt with the fewest tokens left" {
++    const a = std.testing.allocator;
++    var cfg = try lanes.Config.init(a, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(a);
++    var fake: lanes.fake.Fake = .{ .gpa = a };
++    defer fake.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(a, &cfg, fake.backend(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(a, std.testing.io, &core, .{ .lanes = 4 });
++    const tokens: [100]u32 = @splat(7);
++    const reqs = [_]api.Request{
++        .{ .prompt = tokens[0..100], .max_tokens = 1 },
++        .{ .prompt = tokens[0..40], .max_tokens = 1 },
++        .{ .prompt = tokens[0..70], .max_tokens = 1 },
++    };
++    const Stub = struct {
++        fn event(_: *anyopaque, _: Id, _: *const Event) void {}
++    };
++    var jobs: [3]LaneHost.Job = undefined;
++    var list: [3]*LaneHost.Job = undefined;
++    for (&jobs, &list, &reqs, 0..) |*job, *slot, *req, n| {
++        job.* = .{ .host = &host, .id = @intCast(n + 1), .request = req, .sink = .{ .ctx = &host, .event = Stub.event } };
++        job.stream = try lanes.Stream.init(a, .{ .id = "fill", .prompt = req.prompt, .max_new = 1 });
++        slot.* = job;
++    }
++    defer for (&jobs) |*job| job.stream.deinit(a);
++    const pick = LaneHost.pickFill;
++
++    // nothing started: arrival order
++    try std.testing.expectEqual(@as(?usize, 0), pick(&list, .shortest, 0, false));
++    // the 100-token prompt is 10 tokens in; the two new prompts get their first chunk before it continues
++    jobs[0].started = true;
++    jobs[0].filled = 10;
++    try std.testing.expectEqual(@as(?usize, 1), pick(&list, .shortest, 1, false));
++    jobs[1].started = true;
++    jobs[1].filled = 8;
++    try std.testing.expectEqual(@as(?usize, 2), pick(&list, .shortest, 2, false));
++    jobs[2].started = true;
++    jobs[2].filled = 8;
++    // all started: 90, 32 and 62 tokens left. The 40-token prompt reads to its end before the others continue
++    try std.testing.expectEqual(@as(?usize, 1), pick(&list, .shortest, 0, false));
++    jobs[1].filled = 24;
++    try std.testing.expectEqual(@as(?usize, 1), pick(&list, .shortest, 2, false));
++    jobs[1].prefilled = 1;
++    try std.testing.expectEqual(@as(?usize, 2), pick(&list, .shortest, 0, false)); // 62 left against 90
++    // every second chunk goes to the prompt that began first, whatever is left of each: 90 tokens against 62
++    jobs[0].began = 10;
++    jobs[2].began = 30;
++    try std.testing.expectEqual(@as(?usize, 0), pick(&list, .shortest, 0, true));
++    jobs[0].began = 40;
++    try std.testing.expectEqual(@as(?usize, 2), pick(&list, .shortest, 0, true));
++    // a kept state counts: the 100-token prompt resumed at 95 has 5 left
++    jobs[0].stream.cached = 95;
++    try std.testing.expectEqual(@as(?usize, 0), pick(&list, .shortest, 0, false));
++    // a tie goes to the earlier prompt
++    jobs[0].stream.cached = 0;
++    jobs[0].filled = 38;
++    try std.testing.expectEqual(@as(?usize, 0), pick(&list, .shortest, 0, false)); // 62 and 62
++    jobs[0].prefilled = 1;
++    jobs[2].prefilled = 1;
++    try std.testing.expectEqual(@as(?usize, null), pick(&list, .shortest, 0, false));
++
++    // rotate (0031): the next filling prompt from `from`, whatever is left of each
++    jobs[0].prefilled = null;
++    jobs[2].prefilled = null;
++    try std.testing.expectEqual(@as(?usize, 2), pick(&list, .rotate, 1, false)); // 1 has ended
++    try std.testing.expectEqual(@as(?usize, 0), pick(&list, .rotate, 3, false)); // wraps
++    try std.testing.expectEqual(@as(?usize, 2), pick(&list, .rotate, 2, false));
++}
++
++test "the streams' share of the engine's time while a prompt fills" {
++    const ms: i96 = std.time.ns_per_ms;
++    const owed = LaneHost.owedAfter;
++    // share 0: one round after each chunk, nothing owed
++    try std.testing.expectEqual(@as(i96, 0), owed(0, 0, true, 1000 * ms));
++    // half the time: a 1,000 ms chunk is followed by 1,000 ms of rounds, then the next chunk is due
++    var due = owed(0, 50, true, 1000 * ms);
++    try std.testing.expectEqual(1000 * ms, due);
++    due = owed(due, 50, false, 300 * ms);
++    try std.testing.expectEqual(700 * ms, due);
++    due = owed(due, 50, false, 800 * ms);
++    try std.testing.expectEqual(@as(i96, 0), due);
++    // a quarter and three quarters
++    try std.testing.expectEqual(300 * ms, owed(0, 25, true, 900 * ms));
++    try std.testing.expectEqual(3000 * ms, owed(0, 75, true, 1000 * ms));
++    // a new prompt's first chunk runs while rounds are owed: its share is added
++    try std.testing.expectEqual(700 * ms, owed(200 * ms, 50, true, 500 * ms));
++}
 diff --git a/zig/src/core/lanes/backend.zig b/zig/src/core/lanes/backend.zig
 index 929c5ec..2e1597b 100644
 --- a/zig/src/core/lanes/backend.zig
